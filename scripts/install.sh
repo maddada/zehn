@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # zehn installer — clone, build, and install in one shot.
 #
-#   bash <(curl -L https://raw.githubusercontent.com/al3rez/zehn/master/scripts/install.sh)
+#   bash <(curl -L https://al3rez.com/zehn)
 #
 # Honors:
 #   PREFIX     install prefix (default: ~/.local) — binary lands in $PREFIX/bin/zehn

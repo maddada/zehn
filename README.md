@@ -31,7 +31,7 @@ It is one small Zig binary with no runtime dependencies (sqlite3 is optional, an
 One line, macOS or Linux:
 
 ```sh
-bash <(curl -L https://raw.githubusercontent.com/al3rez/zehn/master/scripts/install.sh)
+bash <(curl -L https://al3rez.com/zehn)
 ```
 
 It clones the repo, does a `ReleaseFast` build, and leaves the binary at `~/.local/bin/zehn`. If you don't already have [Zig 0.16+](https://ziglang.org/download/), it grabs it for you — via `brew`/`pacman` when present, otherwise the official tarball from ziglang.org. Set `PREFIX` to install somewhere else (`PREFIX=/usr/local bash <(curl -L ...)`), or `NO_INSTALL_ZIG=1` to make it refuse rather than fetch Zig.
