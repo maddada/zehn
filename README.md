@@ -13,8 +13,17 @@ Find any prompt you have ever typed to an AI coding agent, then drop back into t
 [Sources](#where-does-it-look) ·
 [Matching](#how-matching-works)
 
-![Zig](https://img.shields.io/badge/zig-0.16-f7a41d)
-![License](https://img.shields.io/badge/license-MIT-blue)
+![Zig](https://img.shields.io/badge/Zig-0.16-f7a41d?style=for-the-badge&logo=zig&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)
+![Platform](https://img.shields.io/badge/Linux-555?style=for-the-badge&logo=linux&logoColor=white)
+
+<p>
+  Works with
+  <a href="https://www.anthropic.com/claude-code"><kbd><img src="https://www.google.com/s2/favicons?domain=claude.ai&sz=64" width="14" valign="middle" /> Claude Code</kbd></a> &nbsp;
+  <a href="https://github.com/openai/codex"><kbd><img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" width="14" valign="middle" /> Codex</kbd></a> &nbsp;
+  <a href="https://pi.dev"><kbd><img src="https://pi.dev/favicon.svg" width="14" valign="middle" /> pi</kbd></a> &nbsp;
+  <a href="https://opencode.ai"><kbd><img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=64" width="14" valign="middle" /> opencode</kbd></a>
+</p>
 
 </div>
 
