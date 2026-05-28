@@ -48,10 +48,6 @@ pub const Scanner = struct {
         return std.fmt.allocPrint(self.a, "{s}" ++ suffix, .{self.home}) catch oom();
     }
 
-    fn dup(self: *Scanner, s: []const u8) []const u8 {
-        return self.a.dupe(u8, s) catch oom();
-    }
-
     fn readAll(self: *Scanner, file_path: []const u8) ?[]u8 {
         const dir = Io.Dir.cwd();
         return dir.readFileAlloc(self.io, file_path, self.a, .limited(64 * 1024 * 1024)) catch null;
@@ -137,11 +133,13 @@ pub const Scanner = struct {
             if (o.get("timestamp")) |x| if (x == .integer) {
                 ts = @divTrunc(x.integer, 1000);
             };
+            // No copy: the JSON strings live in the arena (alongside the
+            // file buffer) and persist for the program's lifetime.
             self.add(.{
                 .agent = .claude,
-                .text = self.dup(disp.string),
-                .project = self.dup(proj),
-                .session = self.dup(sess),
+                .text = disp.string,
+                .project = proj,
+                .session = sess,
                 .ts = ts,
             });
         }
@@ -169,9 +167,9 @@ pub const Scanner = struct {
             };
             self.add(.{
                 .agent = .codex,
-                .text = self.dup(txt.string),
+                .text = txt.string,
                 .project = "",
-                .session = self.dup(sess),
+                .session = sess,
                 .ts = ts,
             });
         }
@@ -207,6 +205,15 @@ pub const Scanner = struct {
         var session_id: []const u8 = "";
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
+            // Only session headers and user messages yield records. Skip the
+            // far larger/more numerous assistant & tool lines before paying for
+            // a full JSON parse. pi writes compact JSON with `type` first and
+            // the role marker near the start, so bound the scan to the line
+            // head — otherwise we'd scan multi-KB assistant bodies in full.
+            const head = line[0..@min(line.len, 128)];
+            const keep = std.mem.startsWith(u8, line, "{\"type\":\"session\"") or
+                std.mem.indexOf(u8, head, "\"role\":\"user\"") != null;
+            if (!keep) continue;
             const v = self.parseLine(line) orelse continue;
             if (v != .object) continue;
             const o = v.object;
@@ -214,10 +221,10 @@ pub const Scanner = struct {
             if (typ != .string) continue;
             if (std.mem.eql(u8, typ.string, "session")) {
                 if (o.get("cwd")) |x| if (x == .string) {
-                    cwd = self.dup(x.string);
+                    cwd = x.string;
                 };
                 if (o.get("id")) |x| if (x == .string) {
-                    session_id = self.dup(x.string);
+                    session_id = x.string;
                 };
                 continue;
             }
@@ -231,7 +238,7 @@ pub const Scanner = struct {
             if (text.len == 0) continue;
             self.add(.{
                 .agent = .pi,
-                .text = self.dup(text),
+                .text = text,
                 .project = cwd,
                 .session = session_id,
                 .ts = 0,
@@ -293,9 +300,9 @@ pub const Scanner = struct {
             const sess = if (o.get("session")) |x| (if (x == .string) x.string else "") else "";
             self.add(.{
                 .agent = .opencode,
-                .text = self.dup(txt.string),
-                .project = self.dup(proj),
-                .session = self.dup(sess),
+                .text = txt.string,
+                .project = proj,
+                .session = sess,
                 .ts = 0,
             });
         }
