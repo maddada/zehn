@@ -260,6 +260,8 @@ fn greedy(needle: []const u8, hay: []const u8, start: usize) ?Match {
 }
 
 /// Convenience wrapper for one-off matching (allocates scratch each call).
+/// Test-only: leaks its scratch buffers, so do not use on a hot path — the
+/// runtime uses a reusable `Matcher` instead.
 pub fn match(needle: []const u8, hay: []const u8) ?Match {
     var m = Matcher.init(std.heap.page_allocator);
     return m.match(needle, hay);

@@ -2,6 +2,12 @@ const std = @import("std");
 const Io = std.Io;
 const json = std.json;
 
+/// Allocation failure on the program arena is unrecoverable; crash loudly
+/// rather than silently dropping records or substituting empty strings.
+fn oom() noreturn {
+    @panic("out of memory");
+}
+
 pub const Agent = enum {
     claude,
     codex,
@@ -39,11 +45,11 @@ pub const Scanner = struct {
     }
 
     fn path(self: *Scanner, comptime suffix: []const u8) []const u8 {
-        return std.fmt.allocPrint(self.a, "{s}" ++ suffix, .{self.home}) catch "";
+        return std.fmt.allocPrint(self.a, "{s}" ++ suffix, .{self.home}) catch oom();
     }
 
     fn dup(self: *Scanner, s: []const u8) []const u8 {
-        return self.a.dupe(u8, s) catch "";
+        return self.a.dupe(u8, s) catch oom();
     }
 
     fn readAll(self: *Scanner, file_path: []const u8) ?[]u8 {
@@ -52,7 +58,7 @@ pub const Scanner = struct {
     }
 
     fn add(self: *Scanner, r: Record) void {
-        self.records.append(self.a, r) catch {};
+        self.records.append(self.a, r) catch oom();
     }
 
     /// Extract plain text from a message `content` field that may be either a
@@ -68,8 +74,8 @@ pub const Scanner = struct {
                     if (t != .string or !std.mem.eql(u8, t.string, "text")) continue;
                     const txt = item.object.get("text") orelse continue;
                     if (txt != .string) continue;
-                    if (buf.items.len > 0) buf.append(self.a, ' ') catch {};
-                    buf.appendSlice(self.a, txt.string) catch {};
+                    if (buf.items.len > 0) buf.append(self.a, ' ') catch oom();
+                    buf.appendSlice(self.a, txt.string) catch oom();
                 }
                 if (buf.items.len == 0) return null;
                 return buf.items;
@@ -99,15 +105,12 @@ pub const Scanner = struct {
         defer map.deinit();
         var out: std.ArrayList(Record) = .empty;
         for (self.records.items) |rec| {
-            const key = std.fmt.allocPrint(self.a, "{s}\x00{s}", .{ rec.agent.label(), rec.text }) catch {
-                out.append(self.a, rec) catch {};
-                continue;
-            };
+            const key = std.fmt.allocPrint(self.a, "{s}\x00{s}", .{ rec.agent.label(), rec.text }) catch oom();
             if (map.get(key)) |pos| {
                 if (rec.ts > out.items[pos].ts) out.items[pos] = rec;
             } else {
-                map.put(key, out.items.len) catch {};
-                out.append(self.a, rec) catch {};
+                map.put(key, out.items.len) catch oom();
+                out.append(self.a, rec) catch oom();
             }
         }
         self.records = out;

@@ -8,6 +8,13 @@ const uni = @import("unicode.zig");
 
 const TIOCGWINSZ: u32 = 0x5413;
 
+/// Allocation failure while building a frame is unrecoverable; crash loudly
+/// rather than silently rendering a corrupt screen. (Terminal-cleanup paths
+/// keep best-effort `catch {}` since they run during teardown/signals.)
+fn oom() noreturn {
+    @panic("out of memory");
+}
+
 // Saved terminal state for restoration from a signal handler (which cannot
 // take arguments). Set while the TUI owns the terminal.
 var g_orig: posix.termios = undefined;
@@ -110,7 +117,7 @@ pub const Tui = struct {
         const q = self.query.items;
         for (self.records, 0..) |rec, i| {
             if (self.matcher.match(q, rec.text)) |m| {
-                self.hits.append(self.a, .{ .idx = @intCast(i), .score = m.score, .m = m }) catch {};
+                self.hits.append(self.a, .{ .idx = @intCast(i), .score = m.score, .m = m }) catch oom();
             }
         }
         std.mem.sort(Hit, self.hits.items, self.records, struct {
@@ -153,7 +160,7 @@ pub const Tui = struct {
             const is_ctrl = d.cp < 0x20 or (d.cp >= 0x7f and d.cp < 0xa0);
             const cw: usize = if (is_ctrl) 1 else uni.charWidth(d.cp);
             if (used + cw > max) {
-                buf.appendSlice(self.a, "…") catch {};
+                buf.appendSlice(self.a, "…") catch oom();
                 return;
             }
             // advance highlight cursor past any positions before i
@@ -161,16 +168,16 @@ pub const Tui = struct {
             const hl = pi < m.pos_len and m.positions[pi] == i;
             if (hl) {
                 pi += 1;
-                buf.appendSlice(self.a, "\x1b[1;33m") catch {}; // bold yellow
+                buf.appendSlice(self.a, "\x1b[1;33m") catch oom(); // bold yellow
             }
             if (is_ctrl) {
-                buf.append(self.a, ' ') catch {};
+                buf.append(self.a, ' ') catch oom();
             } else {
-                buf.appendSlice(self.a, text[i .. i + d.len]) catch {};
+                buf.appendSlice(self.a, text[i .. i + d.len]) catch oom();
             }
             if (hl) {
-                buf.appendSlice(self.a, "\x1b[0m") catch {};
-                if (selected) buf.appendSlice(self.a, "\x1b[7m") catch {};
+                buf.appendSlice(self.a, "\x1b[0m") catch oom();
+                if (selected) buf.appendSlice(self.a, "\x1b[7m") catch oom();
             }
             used += cw;
             i += d.len;
@@ -184,14 +191,14 @@ pub const Tui = struct {
         defer buf.deinit(self.a);
         const b = &buf;
 
-        b.appendSlice(self.a, "\x1b[2J\x1b[H") catch {}; // clear + home
+        b.appendSlice(self.a, "\x1b[2J\x1b[H") catch oom(); // clear + home
 
         // prompt line
-        b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch {};
-        b.appendSlice(self.a, self.query.items) catch {};
+        b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch oom();
+        b.appendSlice(self.a, self.query.items) catch oom();
         var cnt: [64]u8 = undefined;
         const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}\x1b[0m\r\n", .{ self.hits.items.len, self.records.len }) catch "\r\n";
-        b.appendSlice(self.a, cs) catch {};
+        b.appendSlice(self.a, cs) catch oom();
 
         const h = self.listHeight();
         const text_max: usize = if (self.cols > 14) self.cols - 14 else 20;
@@ -199,38 +206,38 @@ pub const Tui = struct {
         while (row < h) : (row += 1) {
             const hi = self.top + row;
             if (hi >= self.hits.items.len) {
-                b.appendSlice(self.a, "\r\n") catch {};
+                b.appendSlice(self.a, "\r\n") catch oom();
                 continue;
             }
             const hit = self.hits.items[hi];
             const rec = self.records[hit.idx];
             const selected = hi == self.sel;
-            if (selected) b.appendSlice(self.a, "\x1b[7m") catch {};
-            b.appendSlice(self.a, if (selected) "▌ " else "  ") catch {};
+            if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
+            b.appendSlice(self.a, if (selected) "▌ " else "  ") catch oom();
             // agent tag
-            b.appendSlice(self.a, agentColor(rec.agent)) catch {};
+            b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
             var tag: [16]u8 = undefined;
             const ts = std.fmt.bufPrint(&tag, "{s: <7}", .{rec.agent.label()}) catch rec.agent.label();
-            b.appendSlice(self.a, ts) catch {};
-            b.appendSlice(self.a, "\x1b[0m") catch {};
-            if (selected) b.appendSlice(self.a, "\x1b[7m") catch {};
-            b.append(self.a, ' ') catch {};
+            b.appendSlice(self.a, ts) catch oom();
+            b.appendSlice(self.a, "\x1b[0m") catch oom();
+            if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
+            b.append(self.a, ' ') catch oom();
             self.writeHighlighted(b, rec.text, hit.m, text_max, selected);
-            b.appendSlice(self.a, "\x1b[0m\r\n") catch {};
+            b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
         }
 
         // separator
-        b.appendSlice(self.a, "\x1b[90m") catch {};
+        b.appendSlice(self.a, "\x1b[90m") catch oom();
         var k: usize = 0;
-        while (k < self.cols) : (k += 1) b.append(self.a, '-') catch {};
-        b.appendSlice(self.a, "\x1b[0m\r\n") catch {};
+        while (k < self.cols) : (k += 1) b.append(self.a, '-') catch oom();
+        b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
 
         // preview of selected
         if (self.sel < self.hits.items.len) {
             const rec = self.records[self.hits.items[self.sel].idx];
             var pv: [256]u8 = undefined;
             const head = std.fmt.bufPrint(&pv, "\x1b[90magent:\x1b[0m {s}  \x1b[90mproject:\x1b[0m {s}\r\n", .{ rec.agent.label(), if (rec.project.len > 0) rec.project else "-" }) catch "";
-            b.appendSlice(self.a, head) catch {};
+            b.appendSlice(self.a, head) catch oom();
             // up to 4 lines, wrapped at display width, UTF-8 aware
             var i: usize = 0;
             var line_lines: usize = 0;
@@ -243,11 +250,11 @@ pub const Tui = struct {
                     const is_ctrl = d.cp < 0x20 or (d.cp >= 0x7f and d.cp < 0xa0);
                     const cw: usize = if (is_ctrl) 1 else uni.charWidth(d.cp);
                     if (used + cw > self.cols) break;
-                    if (is_ctrl) b.append(self.a, ' ') catch {} else b.appendSlice(self.a, rec.text[i .. i + d.len]) catch {};
+                    if (is_ctrl) b.append(self.a, ' ') catch oom() else b.appendSlice(self.a, rec.text[i .. i + d.len]) catch oom();
                     used += cw;
                     i += d.len;
                 }
-                b.appendSlice(self.a, "\r\n") catch {};
+                b.appendSlice(self.a, "\r\n") catch oom();
                 // if we stopped on a newline, skip it
                 if (i < rec.text.len and rec.text[i] == '\n') i += 1;
                 line_lines += 1;
@@ -320,7 +327,7 @@ pub const Tui = struct {
                         // accept printable ASCII and any UTF-8 continuation/lead
                         // bytes (>=128), but not DEL
                         if ((c >= 32 and c < 127) or c >= 128) {
-                            self.query.append(self.a, c) catch {};
+                            self.query.append(self.a, c) catch oom();
                             self.recompute();
                         }
                     },
