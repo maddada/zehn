@@ -28,15 +28,15 @@ It is one small Zig binary with no runtime dependencies (sqlite3 is optional, an
 
 ## How do I install it?
 
-You need [Zig 0.16](https://ziglang.org/download/) or newer. Then one line:
+One line, macOS or Linux:
 
 ```sh
 bash <(curl -L https://raw.githubusercontent.com/al3rez/zehn/master/scripts/install.sh)
 ```
 
-It clones the repo, does a `ReleaseFast` build, and leaves the binary at `~/.local/bin/zehn`. Set `PREFIX` to install somewhere else (`PREFIX=/usr/local bash <(curl -L ...)`).
+It clones the repo, does a `ReleaseFast` build, and leaves the binary at `~/.local/bin/zehn`. If you don't already have [Zig 0.16+](https://ziglang.org/download/), it grabs it for you — via `brew`/`pacman` when present, otherwise the official tarball from ziglang.org. Set `PREFIX` to install somewhere else (`PREFIX=/usr/local bash <(curl -L ...)`), or `NO_INSTALL_ZIG=1` to make it refuse rather than fetch Zig.
 
-Prefer to do it by hand?
+Prefer to do it by hand? You'll need [Zig 0.16](https://ziglang.org/download/) or newer.
 
 ```sh
 git clone https://github.com/al3rez/zehn && cd zehn
