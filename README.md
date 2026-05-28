@@ -6,7 +6,7 @@
 
 Find any prompt you have ever typed to an AI coding agent, then drop back into that session.
 
-<img src="assets/demo.gif" width="800" alt="zehn searching across claude, codex, and pi histories">
+<img src="assets/demo.gif" width="100%" alt="zehn searching across claude, codex, and pi histories">
 
 [Install](#how-do-i-install-it) ·
 [Usage](#how-do-i-use-it) ·
