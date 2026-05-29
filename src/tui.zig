@@ -5,6 +5,18 @@ const posix = std.posix;
 const scan = @import("scan.zig");
 const fuzzy = @import("fuzzy.zig");
 const uni = @import("unicode.zig");
+const favorites = @import("favorites.zig");
+
+/// What the user chose to do with the selected record. `resume` is the default
+/// (Enter); `copy` puts the prompt on the clipboard; `fork` starts a fresh
+/// session with the prompt in `fork_agent` (possibly a different agent).
+pub const Action = struct {
+    idx: usize,
+    kind: Kind,
+    fork_agent: scan.Agent = .claude,
+
+    pub const Kind = enum { @"resume", copy, fork };
+};
 
 // TIOCGWINSZ is platform-specific: the Linux value differs from the BSD/Darwin
 // one, and issuing the wrong request (or going through std.os.linux on a
@@ -64,6 +76,7 @@ fn installSignalHandlers() void {
 const Hit = struct {
     idx: u32,
     score: i32,
+    fav: bool,
     m: fuzzy.Match,
 };
 
@@ -89,9 +102,21 @@ pub const Tui = struct {
     cols: u16 = 80,
     orig: posix.termios = undefined,
     matcher: fuzzy.Matcher,
+    fav: *favorites.Set,
+    fav_path: []const u8,
+    /// When set, the picker is in "fork into which agent?" mode and digit keys
+    /// choose the target instead of typing into the query.
+    forking: bool = false,
 
-    pub fn init(a: std.mem.Allocator, io: Io, records: []const scan.Record) Tui {
-        return .{ .a = a, .io = io, .records = records, .matcher = fuzzy.Matcher.init(a) };
+    pub fn init(a: std.mem.Allocator, io: Io, records: []const scan.Record, fav: *favorites.Set, fav_path: []const u8) Tui {
+        return .{
+            .a = a,
+            .io = io,
+            .records = records,
+            .matcher = fuzzy.Matcher.init(a),
+            .fav = fav,
+            .fav_path = fav_path,
+        };
     }
 
     fn winsize(self: *Tui) void {
@@ -134,12 +159,16 @@ pub const Tui = struct {
         const q = self.query.items;
         for (self.records, 0..) |rec, i| {
             if (self.matcher.match(q, rec.text)) |m| {
-                self.hits.append(self.a, .{ .idx = @intCast(i), .score = m.score, .m = m }) catch oom();
+                const is_fav = self.fav.contains(favorites.key(rec.agent.label(), rec.text));
+                self.hits.append(self.a, .{ .idx = @intCast(i), .score = m.score, .fav = is_fav, .m = m }) catch oom();
             }
         }
         std.mem.sort(Hit, self.hits.items, self.records, struct {
             fn lt(recs: []const scan.Record, x: Hit, y: Hit) bool {
-                if (x.score != y.score) return x.score > y.score;
+                // Favorites form a strict tier above the rest (see favorites.rank).
+                const rx = favorites.rank(x.score, x.fav);
+                const ry = favorites.rank(y.score, y.fav);
+                if (rx != ry) return rx > ry;
                 const tx = recs[x.idx].ts;
                 const ty = recs[y.idx].ts;
                 if (tx != ty) return tx > ty; // newer first
@@ -213,12 +242,12 @@ pub const Tui = struct {
         // prompt line
         b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch oom();
         b.appendSlice(self.a, self.query.items) catch oom();
-        var cnt: [64]u8 = undefined;
-        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}\x1b[0m\r\n", .{ self.hits.items.len, self.records.len }) catch "\r\n";
+        var cnt: [128]u8 = undefined;
+        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len }) catch "\r\n";
         b.appendSlice(self.a, cs) catch oom();
 
         const h = self.listHeight();
-        const text_max: usize = if (self.cols > 14) self.cols - 14 else 20;
+        const text_max: usize = if (self.cols > 16) self.cols - 16 else 20;
         var row: usize = 0;
         while (row < h) : (row += 1) {
             const hi = self.top + row;
@@ -231,6 +260,14 @@ pub const Tui = struct {
             const selected = hi == self.sel;
             if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
             b.appendSlice(self.a, if (selected) "▌ " else "  ") catch oom();
+            // favorite marker (bold yellow star), or a blank to keep columns aligned
+            if (hit.fav) {
+                b.appendSlice(self.a, "\x1b[1;33m★\x1b[0m") catch oom();
+                if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
+            } else {
+                b.append(self.a, ' ') catch oom();
+            }
+            b.append(self.a, ' ') catch oom();
             // agent tag
             b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
             var tag: [16]u8 = undefined;
@@ -248,6 +285,16 @@ pub const Tui = struct {
         var k: usize = 0;
         while (k < self.cols) : (k += 1) b.append(self.a, '-') catch oom();
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+
+        // fork mode replaces the preview with an agent picker
+        if (self.forking) {
+            b.appendSlice(self.a, "\x1b[1;36mfork prompt into:\x1b[0m  ") catch oom();
+            b.appendSlice(self.a, "\x1b[1m1\x1b[0m claude  \x1b[1m2\x1b[0m codex  \x1b[1m3\x1b[0m pi  \x1b[1m4\x1b[0m opencode") catch oom();
+            b.appendSlice(self.a, "  \x1b[90m(esc cancels)\x1b[0m\r\n") catch oom();
+            try w.writeAll(b.items);
+            try w.flush();
+            return;
+        }
 
         // preview of selected
         if (self.sel < self.hits.items.len) {
@@ -283,8 +330,8 @@ pub const Tui = struct {
         try w.flush();
     }
 
-    /// Returns the selected record index, or null if cancelled.
-    pub fn run(self: *Tui, w: *Io.Writer) !?usize {
+    /// Returns the chosen Action, or null if cancelled.
+    pub fn run(self: *Tui, w: *Io.Writer) !?Action {
         self.winsize();
         installSignalHandlers();
         try self.enterRaw();
@@ -306,6 +353,29 @@ pub const Tui = struct {
             var i: usize = 0;
             while (i < n) {
                 const c = ibuf[i];
+
+                // While picking a fork target, digits choose the agent and any
+                // other key (esc included) cancels back to normal browsing.
+                if (self.forking) {
+                    self.forking = false;
+                    if (self.sel < self.hits.items.len) {
+                        const agent: ?scan.Agent = switch (c) {
+                            '1' => .claude,
+                            '2' => .codex,
+                            '3' => .pi,
+                            '4' => .opencode,
+                            else => null,
+                        };
+                        if (agent) |ag| return .{
+                            .idx = self.hits.items[self.sel].idx,
+                            .kind = .fork,
+                            .fork_agent = ag,
+                        };
+                    }
+                    i += 1;
+                    continue;
+                }
+
                 if (c == 27) {
                     // escape sequence (arrows) or bare ESC
                     if (i + 2 < n and ibuf[i + 1] == '[') {
@@ -323,8 +393,16 @@ pub const Tui = struct {
                     3 => return null, // ctrl-c
                     13, 10 => {
                         if (self.sel < self.hits.items.len)
-                            return self.hits.items[self.sel].idx;
+                            return .{ .idx = self.hits.items[self.sel].idx, .kind = .@"resume" };
                         return null;
+                    },
+                    6 => self.toggleFavorite(), // ctrl-f
+                    25 => { // ctrl-y: copy selected to clipboard
+                        if (self.sel < self.hits.items.len)
+                            return .{ .idx = self.hits.items[self.sel].idx, .kind = .copy };
+                    },
+                    15 => { // ctrl-o: fork into another agent
+                        if (self.sel < self.hits.items.len) self.forking = true;
                     },
                     127, 8 => {
                         if (self.query.items.len > 0) {
@@ -353,6 +431,24 @@ pub const Tui = struct {
             }
         }
         return null;
+    }
+
+    /// Toggle the favorite flag of the selected prompt, persist, and re-rank.
+    /// Selection follows the same record across the re-sort so the cursor does
+    /// not jump after starring/unstarring.
+    fn toggleFavorite(self: *Tui) void {
+        if (self.sel >= self.hits.items.len) return;
+        const rec_idx = self.hits.items[self.sel].idx;
+        const rec = self.records[rec_idx];
+        _ = self.fav.toggle(favorites.key(rec.agent.label(), rec.text)) catch return;
+        favorites.save(self.fav, self.io, self.a, self.fav_path);
+        self.recompute();
+        for (self.hits.items, 0..) |hh, j| {
+            if (hh.idx == rec_idx) {
+                self.sel = j;
+                break;
+            }
+        }
     }
 
     fn moveDown(self: *Tui) void {
