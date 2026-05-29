@@ -75,6 +75,17 @@ zehn --version
 
 Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit.
 
+Some prompts are worth keeping around. Press `^f` to favorite the selected one — it
+gets a `★` and floats to the top of every result list. Favorites live in
+`$XDG_CONFIG_HOME/zehn/favorites` (or `~/.config/zehn/favorites`), keyed by a hash of
+the prompt so the read-only history files are never touched.
+
+You can also reuse a prompt somewhere other than its origin session. `^y` copies the
+selected prompt to the clipboard (via `pbcopy`/`wl-copy`/`xclip`/`xsel`). `^o` forks it:
+pick an agent (`1` claude, `2` codex, `3` pi, `4` opencode) and zehn starts a fresh
+session there seeded with that prompt — so a prompt you wrote to one agent can be fired
+at another.
+
 ## Where does it look?
 
 | Agent    | History location                               | Resume command            |

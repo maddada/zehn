@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");
-    for ([_][]const u8{ "src/fuzzy.zig", "src/scan.zig" }) |src| {
+    for ([_][]const u8{ "src/fuzzy.zig", "src/scan.zig", "src/favorites.zig", "src/fork.zig" }) |src| {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src),
