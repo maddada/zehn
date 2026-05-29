@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Build Linux (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-linux, aarch64-linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Determine version
+        id: vars
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          version="${{ steps.vars.outputs.version }}"
+          target="${{ matrix.target }}"
+          stage="zehn-${version}-${target}"
+          mkdir -p "$stage"
+          cp zig-out/bin/zehn "$stage/"
+          [ -f README.md ] && cp README.md "$stage/" || true
+          [ -f LICENSE ] && cp LICENSE "$stage/" || true
+          tar -czf "${stage}.tar.gz" "$stage"
+          sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: |
+            zehn-*.tar.gz
+            zehn-*.tar.gz.sha256
+
+  macos:
+    name: Build macOS + dmg
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Determine version
+        id: vars
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build macOS targets and package tarballs
+        run: |
+          set -euo pipefail
+          version="${{ steps.vars.outputs.version }}"
+          for target in x86_64-macos aarch64-macos; do
+            zig build -Doptimize=ReleaseFast -Dtarget="$target"
+            stage="zehn-${version}-${target}"
+            mkdir -p "$stage"
+            cp zig-out/bin/zehn "$stage/"
+            [ -f README.md ] && cp README.md "$stage/" || true
+            [ -f LICENSE ] && cp LICENSE "$stage/" || true
+            tar -czf "${stage}.tar.gz" "$stage"
+            shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          done
+
+      - name: Build dmg
+        run: |
+          set -euo pipefail
+          version="${{ steps.vars.outputs.version }}"
+          dmgroot="dmg-staging/zehn-${version}"
+          mkdir -p "$dmgroot"
+          # arm64 binary
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos
+          cp zig-out/bin/zehn "$dmgroot/zehn-aarch64"
+          # x86_64 binary
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos
+          cp zig-out/bin/zehn "$dmgroot/zehn-x86_64"
+          [ -f README.md ] && cp README.md "$dmgroot/" || true
+          [ -f LICENSE ] && cp LICENSE "$dmgroot/" || true
+          dmgname="zehn-${version}-macos.dmg"
+          hdiutil create -volname "zehn ${version}" -srcfolder dmg-staging -ov -format UDZO "$dmgname"
+          shasum -a 256 "$dmgname" > "$dmgname.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            zehn-*.tar.gz
+            zehn-*.tar.gz.sha256
+            zehn-*.dmg
+            zehn-*.dmg.sha256
+
+  release:
+    name: Publish Release
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute combined checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum zehn-*.tar.gz zehn-*.dmg > checksums.txt
+          cat checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/zehn-*.tar.gz
+            dist/zehn-*.dmg
+            dist/checksums.txt
