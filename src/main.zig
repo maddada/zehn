@@ -5,7 +5,7 @@ const tui = @import("tui.zig");
 const favorites = @import("favorites.zig");
 const fork = @import("fork.zig");
 
-const version = "0.2.0";
+const version = "0.2.1";
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
