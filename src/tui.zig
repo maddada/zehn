@@ -1,12 +1,19 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const posix = std.posix;
-const linux = std.os.linux;
 const scan = @import("scan.zig");
 const fuzzy = @import("fuzzy.zig");
 const uni = @import("unicode.zig");
 
-const TIOCGWINSZ: u32 = 0x5413;
+// TIOCGWINSZ is platform-specific: the Linux value differs from the BSD/Darwin
+// one, and issuing the wrong request (or going through std.os.linux on a
+// non-Linux target) returns garbage instead of failing — which is how the
+// terminal size came back as 0xAAAA on macOS and scrolled the whole UI away.
+const TIOCGWINSZ: c_int = switch (builtin.os.tag) {
+    .linux => 0x5413,
+    else => 0x40087468, // macOS/BSD
+};
 
 /// Allocation failure while building a frame is unrecoverable; crash loudly
 /// rather than silently rendering a corrupt screen. (Terminal-cleanup paths
@@ -24,7 +31,10 @@ fn restoreTerminal() void {
     if (!g_active) return;
     g_active = false;
     const seq = "\x1b[?25h\x1b[?1049l"; // show cursor, leave alt-screen
-    _ = linux.write(1, seq.ptr, seq.len);
+    switch (builtin.os.tag) {
+        .linux => _ = std.os.linux.write(1, seq.ptr, seq.len),
+        else => _ = std.c.write(1, seq.ptr, seq.len),
+    }
     posix.tcsetattr(0, .FLUSH, g_orig) catch {};
 }
 
@@ -86,8 +96,15 @@ pub const Tui = struct {
 
     fn winsize(self: *Tui) void {
         var ws: posix.winsize = undefined;
-        const r = linux.ioctl(0, TIOCGWINSZ, @intFromPtr(&ws));
-        if (r == 0 and ws.row > 0) {
+        const ok = switch (builtin.os.tag) {
+            .linux => std.os.linux.ioctl(0, @intCast(TIOCGWINSZ), @intFromPtr(&ws)) == 0,
+            else => std.c.ioctl(0, TIOCGWINSZ, @intFromPtr(&ws)) == 0,
+        };
+        // Reject implausible sizes: a bad ioctl can leave `ws` uninitialised
+        // (we've seen 0xAAAA come back on macOS), and a multi-thousand-row
+        // "terminal" makes render() emit a giant blank frame that scrolls all
+        // real output off-screen — looking like the app printed nothing.
+        if (ok and ws.row > 0 and ws.col > 0 and ws.row <= 4096 and ws.col <= 4096) {
             self.rows = ws.row;
             self.cols = ws.col;
         }

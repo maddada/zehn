@@ -148,14 +148,31 @@ trap 'rm -rf "$tmp"' EXIT
 
 ensure_zig
 
+bin="$PREFIX/bin/zehn"
+
+# If zehn is already here, this run is an upgrade: note the old version so we
+# can report what changed. Re-running always rebuilds from the latest master,
+# so a plain re-run is all you need to update.
+old_ver=""
+if [ -x "$bin" ]; then
+  old_ver="$("$bin" --version 2>/dev/null | awk '{print $2}')"
+  info "Found existing zehn ${old_ver:-(unknown version)} — upgrading to latest"
+fi
+
 info "Cloning $REPO ..."
 git clone --depth 1 "$REPO" "$tmp/zehn"
 
 info "Building (ReleaseFast) ..."
 zig build -Doptimize=ReleaseFast --prefix "$PREFIX" --build-file "$tmp/zehn/build.zig"
 
-bin="$PREFIX/bin/zehn"
-info "Installed zehn to $bin"
+new_ver="$("$bin" --version 2>/dev/null | awk '{print $2}')"
+if [ -n "$old_ver" ] && [ "$old_ver" != "$new_ver" ]; then
+  info "Upgraded zehn $old_ver -> ${new_ver:-?} at $bin"
+elif [ -n "$old_ver" ]; then
+  info "Reinstalled zehn ${new_ver:-?} (already latest) at $bin"
+else
+  info "Installed zehn ${new_ver:-?} to $bin"
+fi
 
 case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
