@@ -1,11 +1,11 @@
+//! "Forking" a prompt means reusing its text somewhere other than its origin
+//! session: copy it to the clipboard, or start a *fresh* session with it in any
+//! agent (including a different one than it came from). These builders are pure
+//! so the argv decisions are unit-testable; the actual spawning lives in main.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const scan = @import("scan.zig");
-
-/// "Forking" a prompt means reusing its text somewhere other than its origin
-/// session: copy it to the clipboard, or start a *fresh* session with it in any
-/// agent (including a different one than it came from). These builders are pure
-/// so the argv decisions are unit-testable; the actual spawning lives in main.
 
 /// Clipboard copy commands to try in order. Different platforms (and Linux
 /// display servers) ship different tools, so we attempt each until one works.
@@ -17,7 +17,7 @@ pub fn clipboardCandidates() []const []const []const u8 {
             &.{"pbcopy"},
         },
         else => &.{
-            &.{ "wl-copy" }, // wayland
+            &.{"wl-copy"}, // wayland
             &.{ "xclip", "-selection", "clipboard" }, // x11
             &.{ "xsel", "--clipboard", "--input" }, // x11 alt
         },

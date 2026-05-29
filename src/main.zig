@@ -82,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
     // Favorites: a small persistent set so reused prompts can be starred and
     // floated to the top of results. Missing file just means an empty set.
     const xdg = init.environ_map.get("XDG_CONFIG_HOME");
-    const fav_path = favorites.pathFor(a, home, xdg) catch unreachable;
+    const fav_path = try favorites.pathFor(a, home, xdg);
     var fav = favorites.Set.init(a);
     favorites.load(&fav, io, a, fav_path);
 
@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         switch (action.kind) {
-            .@"resume" => try resumeSession(init, io, w, rec),
+            .resume_session => try resumeSession(init, io, w, rec),
             .copy => try copyPrompt(io, w, rec),
             .fork => try forkSession(init, io, w, rec, action.fork_agent),
         }
@@ -214,9 +214,9 @@ fn resumeSession(init: std.process.Init, io: Io, w: *Io.Writer, rec: scan.Record
         .environ_map = init.environ_map,
     }) catch |err| {
         try w.print("zehn: failed to launch {s} ({t})\nRun manually:\n  cd {s} && {s} {s} {s}\n", .{
-            argv[0], err,
-            if (rec.project.len > 0) rec.project else ".",
-            argv[0],            argv[1],            argv[2],
+            argv[0],                                       err,
+            if (rec.project.len > 0) rec.project else ".", argv[0],
+            argv[1],                                       argv[2],
         });
         try w.flush();
         return;

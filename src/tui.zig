@@ -15,7 +15,7 @@ pub const Action = struct {
     kind: Kind,
     fork_agent: scan.Agent = .claude,
 
-    pub const Kind = enum { @"resume", copy, fork };
+    pub const Kind = enum { resume_session, copy, fork };
 };
 
 // TIOCGWINSZ is platform-specific: the Linux value differs from the BSD/Darwin
@@ -393,7 +393,7 @@ pub const Tui = struct {
                     3 => return null, // ctrl-c
                     13, 10 => {
                         if (self.sel < self.hits.items.len)
-                            return .{ .idx = self.hits.items[self.sel].idx, .kind = .@"resume" };
+                            return .{ .idx = self.hits.items[self.sel].idx, .kind = .resume_session };
                         return null;
                     },
                     6 => self.toggleFavorite(), // ctrl-f
