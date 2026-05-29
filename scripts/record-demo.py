@@ -60,12 +60,32 @@ def seed_history(home):
                 "role": "user", "content": [{"type": "text", "text": p}]}}) + "\n")
 
 
+def make_fake_agents(home):
+    """Stub agent CLIs so a fork actually lands and prints a banner in the demo
+    instead of failing (the real claude/codex/... aren't on the sandbox PATH)."""
+    binp = f"{home}/bin"
+    os.makedirs(binp, exist_ok=True)
+    colors = {"claude": "38;2;218;119;86", "codex": "38;2;16;163;127",
+              "pi": "38;2;136;192;208", "opencode": "38;2;207;206;205"}
+    for name, color in colors.items():
+        p = f"{binp}/{name}"
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\n")
+            f.write(f'printf "\\033[{color}m{name}\\033[0m \\033[90mnew session\\033[0m\\n"\n')
+            f.write('printf "\\033[90m> \\033[0m%s\\n" "$1"\n')
+            f.write("sleep 1.2\n")
+        os.chmod(p, 0o755)
+    return binp
+
+
 seed_history(HOME)
+FAKE_BIN = make_fake_agents(HOME)
 
 env = dict(os.environ)
 env["HOME"] = HOME
 env["TERM"] = "xterm-256color"
 env["COLORTERM"] = "truecolor"
+env["PATH"] = FAKE_BIN + ":" + env.get("PATH", "")  # so a fork finds the stub agents
 
 pid, fd = pty.fork()
 if pid == 0:
@@ -106,15 +126,14 @@ CTRL_F, CTRL_O, CTRL_Y, ESC, DOWN = b"\x06", b"\x0f", b"\x19", b"\x1b", b"\x1b[B
 
 # --- demo script ---
 drain(1.3)                          # show the full cross-agent list
-type_str("deploy"); drain(1.1)      # fuzzy filter across agents
-os.write(fd, CTRL_F); drain(1.0)    # ★ favorite the top match
-os.write(fd, DOWN); drain(0.45)
-os.write(fd, CTRL_F); drain(1.0)    # favorite another
+type_str("deploy"); drain(1.0)      # fuzzy filter across agents
+os.write(fd, CTRL_F); drain(0.9)    # ★ favorite the top match
+os.write(fd, DOWN); drain(0.4)
+os.write(fd, CTRL_F); drain(0.9)    # favorite another
 for _ in range(6): os.write(fd, b"\x7f")  # clear the query
-drain(1.6)                          # ★ favorites are pinned to the top of the list
-os.write(fd, CTRL_O); drain(1.5)    # fork: pick an agent to reuse the prompt in
-os.write(fd, ESC); drain(0.8)       # cancel the fork picker
-os.write(fd, CTRL_Y); drain(1.1)    # copy the prompt to the clipboard, exits
+drain(1.5)                          # ★ favorites are pinned to the top of the list
+os.write(fd, CTRL_O); drain(1.6)    # ^o fork: pick an agent to reuse the prompt in
+os.write(fd, b"2"); drain(2.0)      # 2 -> start a fresh CODEX session with this prompt
 
 try:
     os.waitpid(pid, 0)
