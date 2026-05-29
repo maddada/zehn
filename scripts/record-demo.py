@@ -4,6 +4,11 @@
 Self-seeds a small, curated history under a throwaway HOME so the recording is
 reproducible and never leaks real prompts. Demonstrates the picker plus the
 favorite / copy / fork keys.
+
+The fork step launches the REAL codex CLI (so the demo shows codex's actual
+TUI, not a stub). Reproducing it therefore needs `codex` on PATH and signed in;
+CODEX_HOME is pointed at the user's real ~/.codex while zehn reads the seeded
+HOME. codex runs for a few seconds then is killed, so it makes no changes.
 """
 import os, pty, select, struct, fcntl, termios, time, json, sys, shutil
 
@@ -60,32 +65,15 @@ def seed_history(home):
                 "role": "user", "content": [{"type": "text", "text": p}]}}) + "\n")
 
 
-def make_fake_agents(home):
-    """Stub agent CLIs so a fork actually lands and prints a banner in the demo
-    instead of failing (the real claude/codex/... aren't on the sandbox PATH)."""
-    binp = f"{home}/bin"
-    os.makedirs(binp, exist_ok=True)
-    colors = {"claude": "38;2;218;119;86", "codex": "38;2;16;163;127",
-              "pi": "38;2;136;192;208", "opencode": "38;2;207;206;205"}
-    for name, color in colors.items():
-        p = f"{binp}/{name}"
-        with open(p, "w") as f:
-            f.write("#!/bin/sh\n")
-            f.write(f'printf "\\033[{color}m{name}\\033[0m \\033[90mnew session\\033[0m\\n"\n')
-            f.write('printf "\\033[90m> \\033[0m%s\\n" "$1"\n')
-            f.write("sleep 1.2\n")
-        os.chmod(p, 0o755)
-    return binp
-
-
 seed_history(HOME)
-FAKE_BIN = make_fake_agents(HOME)
 
 env = dict(os.environ)
 env["HOME"] = HOME
 env["TERM"] = "xterm-256color"
 env["COLORTERM"] = "truecolor"
-env["PATH"] = FAKE_BIN + ":" + env.get("PATH", "")  # so a fork finds the stub agents
+# zehn reads the seeded history under the throwaway HOME, but a fork launches the
+# REAL codex — point CODEX_HOME at the user's actual config so it keeps its auth.
+env["CODEX_HOME"] = os.path.expanduser("~/.codex")
 
 pid, fd = pty.fork()
 if pid == 0:
@@ -122,7 +110,8 @@ def type_str(s, cps=0.07):
         drain(cps)
 
 
-CTRL_F, CTRL_O, CTRL_Y, ESC, DOWN = b"\x06", b"\x0f", b"\x19", b"\x1b", b"\x1b[B"
+CTRL_C, CTRL_F, CTRL_O, CTRL_Y, ESC, ENTER, DOWN = (
+    b"\x03", b"\x06", b"\x0f", b"\x19", b"\x1b", b"\r", b"\x1b[B")
 
 # --- demo script ---
 drain(1.3)                          # show the full cross-agent list
@@ -133,8 +122,20 @@ os.write(fd, CTRL_F); drain(0.9)    # favorite another
 for _ in range(6): os.write(fd, b"\x7f")  # clear the query
 drain(1.5)                          # ★ favorites are pinned to the top of the list
 os.write(fd, CTRL_O); drain(1.6)    # ^o fork: pick an agent to reuse the prompt in
-os.write(fd, b"2"); drain(2.0)      # 2 -> start a fresh CODEX session with this prompt
+os.write(fd, b"2"); drain(2.2)      # 2 -> launch the real codex with this prompt
+os.write(fd, ENTER); drain(3.5)     # trust the dir -> codex opens with the forked prompt
+os.write(fd, CTRL_C); drain(0.4)    # quit codex
+os.write(fd, CTRL_C); drain(0.6)
 
+# Tear down the whole tree (recorder -> zehn -> codex); codex may not exit on its
+# own, so kill the process group rather than block forever on waitpid.
+import signal
+try:
+    os.killpg(os.getpgid(pid), signal.SIGTERM)
+    time.sleep(0.3)
+    os.killpg(os.getpgid(pid), signal.SIGKILL)
+except Exception:
+    pass
 try:
     os.waitpid(pid, 0)
 except Exception:
