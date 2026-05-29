@@ -14,7 +14,7 @@ Find any prompt you have ever typed to an AI coding agent, then drop back into t
 [Matching](#how-matching-works)
 
 ![Zig](https://img.shields.io/badge/Zig-0.16-f7a41d?style=for-the-badge&logo=zig&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)
+![License](https://img.shields.io/badge/License-PolyForm%20Noncommercial-blue?style=for-the-badge)
 ![Platform](https://img.shields.io/badge/Linux-555?style=for-the-badge&logo=linux&logoColor=white)
 
 <p>
@@ -109,4 +109,6 @@ zehn (ذهن) means "the mind" in Persian and Arabic. It is short, it is easy to
 
 ## License
 
-MIT.
+[PolyForm Noncommercial 1.0.0](LICENSE). Free to use, modify, and share for any
+noncommercial purpose (personal projects, research, nonprofits, education).
+Commercial use needs a separate license — open an issue or reach out.
