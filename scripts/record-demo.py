@@ -10,7 +10,7 @@ TUI, not a stub). Reproducing it therefore needs `codex` on PATH and signed in;
 CODEX_HOME is pointed at the user's real ~/.codex while zehn reads the seeded
 HOME. codex runs for a few seconds then is killed, so it makes no changes.
 """
-import os, pty, select, struct, fcntl, termios, time, json, sys, shutil
+import os, pty, select, struct, fcntl, termios, time, json, sys, shutil, sqlite3
 
 W, H = 100, 22
 BIN = sys.argv[1] if len(sys.argv) > 1 else "./zig-out/bin/zehn"
@@ -19,28 +19,30 @@ HOME = "/tmp/zehn-demo"
 
 
 def seed_history(home):
-    """Write a curated cross-agent history so the demo has realistic content."""
+    """Write a curated history across ALL four agents (claude, codex, pi, and
+    opencode) so the demo shows every brand color. A "deploy" prompt lives in
+    each agent so the filter step surfaces all of them at once."""
     shutil.rmtree(home, ignore_errors=True)  # fresh state (also clears favorites)
 
     claude = [
         "deploy the staging build to fly.io",
         "add JWT auth middleware to the API",
         "write a React hook for debounced search",
-        "fix the flaky timeout in the deploy pipeline",
-        "explain this borrow checker error",
         "set up a GitHub Actions release workflow",
-        "refactor the auth module to use sessions",
         "add a dark mode toggle to the navbar",
     ]
     codex = [
+        "deploy the worker to Cloud Run",
         "optimize the SQL query for the dashboard",
         "generate unit tests for the parser",
-        "deploy the worker to Cloud Run",
-        "convert this callback code to async/await",
     ]
     pi = [
+        "deploy a hotfix to production",
         "draft a migration plan for the new schema",
-        "summarize the auth refactor for the PR",
+    ]
+    opencode = [
+        "refactor the deploy script to bash",
+        "scaffold a REST endpoint for invoices",
     ]
 
     os.makedirs(f"{home}/.claude", exist_ok=True)
@@ -57,12 +59,35 @@ def seed_history(home):
         for i, p in enumerate(codex):
             f.write(json.dumps({"session_id": f"x{i}", "ts": 1748000000 + i,
                                 "text": p}) + "\n")
+    # pi: write COMPACT json — zehn's parser pre-filters lines by matching the
+    # exact substrings {"type":"session" and "role":"user" (no spaces), so
+    # json.dumps' default ", "/": " spacing would make every line get skipped.
+    compact = lambda o: json.dumps(o, separators=(",", ":"))
     with open(f"{sess}/session.jsonl", "w") as f:
-        f.write(json.dumps({"type": "session", "version": 3,
-                            "id": "019e-demo", "cwd": "~/work/app"}) + "\n")
+        f.write(compact({"type": "session", "version": 3,
+                         "id": "019e-demo", "cwd": "~/work/app"}) + "\n")
         for p in pi:
-            f.write(json.dumps({"type": "message", "message": {
+            f.write(compact({"type": "message", "message": {
                 "role": "user", "content": [{"type": "text", "text": p}]}}) + "\n")
+
+    # opencode keeps history in a SQLite DB (part/message/session); build a
+    # minimal one matching the columns zehn's query reads.
+    dbdir = f"{home}/.local/share/opencode"
+    os.makedirs(dbdir, exist_ok=True)
+    con = sqlite3.connect(f"{dbdir}/opencode.db")
+    cur = con.cursor()
+    cur.execute("CREATE TABLE session(id TEXT, directory TEXT)")
+    cur.execute("CREATE TABLE message(id TEXT, session_id TEXT, data TEXT)")
+    cur.execute("CREATE TABLE part(message_id TEXT, session_id TEXT, data TEXT)")
+    cur.execute("INSERT INTO session VALUES(?,?)", ("oc-demo", "~/work/app"))
+    for i, p in enumerate(opencode):
+        mid = f"m{i}"
+        cur.execute("INSERT INTO message VALUES(?,?,?)",
+                    (mid, "oc-demo", json.dumps({"role": "user"})))
+        cur.execute("INSERT INTO part VALUES(?,?,?)",
+                    (mid, "oc-demo", json.dumps({"type": "text", "text": p})))
+    con.commit()
+    con.close()
 
 
 seed_history(HOME)
