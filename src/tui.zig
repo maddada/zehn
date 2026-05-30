@@ -206,7 +206,7 @@ pub const Tui = struct {
             // overflowing the terminal when the window is short.
             return @min(@as(usize, 13), self.rows -| 3);
         }
-        return if (self.fullscreen_preview) self.rows -| 2 else 5;
+        return if (self.fullscreen_preview) self.rows -| 2 else 7;
     }
 
     fn listHeight(self: *Tui) usize {
@@ -360,9 +360,11 @@ pub const Tui = struct {
         // preview of selected
         if (self.sel < self.hits.items.len) {
             const rec = self.records[self.hits.items[self.sel].idx];
+            const bottom_rows = self.bottomRowsAfterList(h);
             self.writeProjectLine(b, rec);
-            const preview_lines: usize = if (self.fullscreen_preview) self.rows -| 3 else 4;
-            if (self.preview_focus) b.appendSlice(self.a, "\x1b[1;36mpreview\x1b[0m\r\n") catch oom();
+            const fixed_rows: usize = 3; // project line + blank + metadata line
+            const preview_lines: usize = if (bottom_rows > fixed_rows) bottom_rows - fixed_rows else 1;
+            if (self.preview_focus and preview_lines > 1) b.appendSlice(self.a, "\x1b[1;36mpreview\x1b[0m\r\n") catch oom();
             // preview lines, wrapped at display width when enabled, UTF-8 aware
             var i: usize = 0;
             var skipped: usize = 0;
@@ -866,7 +868,8 @@ pub const Tui = struct {
         b.appendSlice(self.a, self.project_query.items) catch oom();
         b.appendSlice(self.a, "\r\n\r\n") catch oom();
         const count = self.projectCount();
-        const rows_avail = if (max_rows > 3) max_rows - 3 else 1;
+        // Budget for: blank, search line, blank, optional scroll info, blank, hint.
+        const rows_avail = if (max_rows > 6) max_rows - 6 else 1;
         const visible = @min(rows_avail, count);
         const start = if (count <= visible) 0 else @min(self.project_sel, count - visible);
         var shown: usize = 0;
@@ -1121,7 +1124,7 @@ test "preview focus keys cover scroll, jump, wrap and fullscreen state" {
 
     tui.wrap_preview = true;
     tui.fullscreen_preview = false;
-    try testing.expectEqual(@as(usize, 23), tui.listHeight());
+    try testing.expectEqual(@as(usize, 21), tui.listHeight());
     tui.wrap_preview = !tui.wrap_preview;
     tui.fullscreen_preview = !tui.fullscreen_preview;
     try testing.expect(!tui.wrap_preview);
