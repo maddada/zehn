@@ -650,12 +650,14 @@ pub const Tui = struct {
         if (self.sel + 1 < self.hits.items.len) {
             self.sel += 1;
             self.preview_scroll = 0;
+            self.result_scroll = 0;
         }
     }
     fn moveUp(self: *Tui) void {
         if (self.sel > 0) {
             self.sel -= 1;
             self.preview_scroll = 0;
+            self.result_scroll = 0;
         }
     }
 };
@@ -757,4 +759,54 @@ test "horizontal result scroll exposes tail of skill-heavy prompts" {
 
     try testing.expect(std.mem.indexOf(u8, out.items, "MY PROMPT") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "/skill lots") == null);
+}
+
+test "golden: horizontally scrolled result row" {
+    var tui = testTui();
+    tui.result_scroll = 23;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    tui.writeHighlighted(&out, "/skill lots of boilerplate MY PROMPT", .{ .score = 0 }, 40, true);
+
+    try testing.expectEqualStrings("…ate MY PROMPT", out.items);
+}
+
+test "preview focus keys cover scroll, jump, wrap and fullscreen state" {
+    var tui = testTui();
+    tui.preview_focus = true;
+    tui.rows = 30;
+
+    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[C"));
+    try testing.expectEqual(@as(usize, 8), tui.result_scroll);
+    try testing.expectEqual(@as(?usize, 6), tui.handleEscapeSequence("\x1b[1;5D"));
+    try testing.expectEqual(@as(usize, 0), tui.result_scroll);
+
+    tui.wrap_preview = true;
+    tui.fullscreen_preview = false;
+    try testing.expectEqual(@as(usize, 23), tui.listHeight());
+    tui.wrap_preview = !tui.wrap_preview;
+    tui.fullscreen_preview = !tui.fullscreen_preview;
+    try testing.expect(!tui.wrap_preview);
+    try testing.expect(tui.fullscreen_preview);
+    try testing.expectEqual(@as(usize, 1), tui.listHeight());
+}
+
+test "selection changes reset preview and result scroll" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "s1", .text = "first", .ts = 1 },
+        .{ .agent = .claude, .project = "p", .session = "s2", .text = "second", .ts = 2 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    tui.recompute();
+    tui.preview_scroll = 3;
+    tui.result_scroll = 9;
+
+    tui.moveDown();
+
+    try testing.expectEqual(@as(usize, 0), tui.preview_scroll);
+    try testing.expectEqual(@as(usize, 0), tui.result_scroll);
 }
