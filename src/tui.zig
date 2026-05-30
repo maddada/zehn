@@ -335,9 +335,6 @@ pub const Tui = struct {
         // preview of selected
         if (self.sel < self.hits.items.len) {
             const rec = self.records[self.hits.items[self.sel].idx];
-            var pv: [256]u8 = undefined;
-            const head = std.fmt.bufPrint(&pv, "\x1b[90magent:\x1b[0m {s}  \x1b[90mfilter:\x1b[0m {s}  \x1b[90mproject:\x1b[0m {s}\r\n", .{ rec.agent.label(), self.agentFilterLabel(), if (rec.project.len > 0) rec.project else "-" }) catch "";
-            b.appendSlice(self.a, head) catch oom();
             const preview_lines: usize = if (self.fullscreen_preview) self.rows -| 3 else 4;
             if (self.preview_focus) b.appendSlice(self.a, "\x1b[1;36mpreview\x1b[0m\r\n") catch oom();
             // preview lines, wrapped at display width when enabled, UTF-8 aware
@@ -373,6 +370,7 @@ pub const Tui = struct {
                 line_lines += 1;
                 if (i == line_start and used == 0) i += 1; // guarantee progress
             }
+            self.writeStatusLine(b, rec);
         }
 
         try w.writeAll(b.items);
@@ -617,6 +615,19 @@ pub const Tui = struct {
     fn nextChar(q: []const u8, pos: usize) usize {
         if (pos >= q.len) return q.len;
         return pos + uni.decode(q[pos..]).len;
+    }
+
+    fn writeStatusLine(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record) void {
+        const project = if (rec.project.len > 0) std.fs.path.basename(rec.project) else "-";
+        const pos = if (self.hits.items.len == 0) 0 else self.sel + 1;
+        b.print(self.a, "\x1b[90m{s}  {d}/{d}  filter:{s}  ({s})  wrap:{s}\x1b[0m\r\n", .{
+            project,
+            pos,
+            self.hits.items.len,
+            self.agentFilterLabel(),
+            rec.agent.label(),
+            if (self.wrap_preview) "on" else "off",
+        }) catch oom();
     }
 
     fn agentBit(agent: scan.Agent) u4 {
