@@ -666,7 +666,6 @@ pub const Tui = struct {
         const pos = if (self.hits.items.len == 0) 0 else self.sel + 1;
         b.print(self.a, "  {d}/{d}", .{ pos, self.hits.items.len }) catch oom();
         self.writeAgentFilterStatus(b);
-        self.writeProjectFilterStatus(b);
         b.appendSlice(self.a, "\x1b[0m\r\n\r\n") catch oom();
     }
 
@@ -716,10 +715,6 @@ pub const Tui = struct {
         }
     }
 
-    fn writeProjectFilterStatus(self: *Tui, b: *std.ArrayList(u8)) void {
-        if (self.project_filter) |project| b.print(self.a, "  project:{s}", .{std.fs.path.basename(project)}) catch oom();
-    }
-
     fn agentBit(agent: scan.Agent) u4 {
         return switch (agent) {
             .claude => 1 << 0,
@@ -757,10 +752,15 @@ pub const Tui = struct {
         const agents = [_]scan.Agent{ .claude, .codex, .pi, .opencode };
         const rows = @min(max_rows, agents.len);
         for (agents[0..rows], 0..) |agent, idx| {
+            const focused = idx == self.filter_sel;
             const selected = (self.agent_filter_mask & agentBit(agent)) != 0;
-            b.appendSlice(self.a, if (idx == self.filter_sel) "\x1b[1;36m→ " else "  ") catch oom();
-            b.print(self.a, "{s}\x1b[0m", .{agent.label()}) catch oom();
-            if (selected) b.appendSlice(self.a, "  \x1b[1;32m✓\x1b[0m") catch oom();
+            if (focused) {
+                b.appendSlice(self.a, "\x1b[1;36m→ ") catch oom();
+                b.print(self.a, "{s}\x1b[0m", .{agent.label()}) catch oom();
+            } else {
+                b.print(self.a, "  {s}", .{agent.label()}) catch oom();
+            }
+            if (selected) b.appendSlice(self.a, " \x1b[1;32m✓\x1b[0m") catch oom();
             b.appendSlice(self.a, "\r\n") catch oom();
         }
         b.appendSlice(self.a, "\r\n\x1b[90mSelect none to show all agents.\x1b[0m\r\n") catch oom();
@@ -860,14 +860,19 @@ pub const Tui = struct {
         while (shown < visible) : (shown += 1) {
             const idx = start + shown;
             const p = self.projectAt(idx);
-            b.appendSlice(self.a, if (idx == self.project_sel) "\x1b[1;36m→ \x1b[0m" else "  ") catch oom();
+            const focused = idx == self.project_sel;
             const label = if (p) |path| std.fs.path.basename(path) else "-";
-            b.print(self.a, "{s}\x1b[0m", .{label}) catch oom();
+            if (focused) {
+                b.appendSlice(self.a, "\x1b[1;36m→ ") catch oom();
+                b.print(self.a, "{s}\x1b[0m", .{label}) catch oom();
+            } else {
+                b.print(self.a, "  {s}", .{label}) catch oom();
+            }
             const selected = if (p) |path| blk: {
                 if (self.project_filter) |cur| break :blk std.mem.eql(u8, cur, path);
                 break :blk false;
             } else self.project_filter == null;
-            if (selected) b.appendSlice(self.a, "  \x1b[1;32m✓\x1b[0m") catch oom();
+            if (selected) b.appendSlice(self.a, " \x1b[1;32m✓\x1b[0m") catch oom();
             b.appendSlice(self.a, "\r\n") catch oom();
         }
         if (count > visible) b.print(self.a, "  \x1b[90m({d}/{d})\x1b[0m\r\n", .{ self.project_sel + 1, count }) catch oom();
