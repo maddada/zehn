@@ -104,6 +104,7 @@ pub const Tui = struct {
     preview_focus: bool = false,
     wrap_preview: bool = true,
     fullscreen_preview: bool = false,
+    agent_filter: ?scan.Agent = null,
     rows: u16 = 24,
     cols: u16 = 80,
     orig: posix.termios = undefined,
@@ -164,6 +165,7 @@ pub const Tui = struct {
         self.hits.clearRetainingCapacity();
         const q = self.query.items;
         for (self.records, 0..) |rec, i| {
+            if (self.agent_filter) |agent| if (rec.agent != agent) continue;
             if (self.matcher.match(q, rec.text)) |m| {
                 const is_fav = self.fav.contains(favorites.key(rec.agent.label(), rec.text));
                 self.hits.append(self.a, .{ .idx = @intCast(i), .score = m.score, .fav = is_fav, .m = m }) catch oom();
@@ -255,7 +257,7 @@ pub const Tui = struct {
         b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch oom();
         self.writeQueryWithCursor(b);
         var cnt: [128]u8 = undefined;
-        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len }) catch "\r\n";
+        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  tool:{s}  ·  ^t filter  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len, self.agentFilterLabel() }) catch "\r\n";
         b.appendSlice(self.a, cs) catch oom();
 
         const h = self.listHeight();
@@ -436,6 +438,7 @@ pub const Tui = struct {
                         if (self.sel < self.hits.items.len) self.forking = true;
                     },
                     11 => self.killToEnd(), // ctrl-k
+                    20 => self.cycleAgentFilter(), // ctrl-t
                     21 => self.killToBeginning(), // ctrl-u
                     87, 119 => { // w/W
                         if (self.preview_focus) self.wrap_preview = !self.wrap_preview else self.insertQueryByte(c);
@@ -563,6 +566,20 @@ pub const Tui = struct {
     fn nextChar(q: []const u8, pos: usize) usize {
         if (pos >= q.len) return q.len;
         return pos + uni.decode(q[pos..]).len;
+    }
+
+    fn agentFilterLabel(self: *const Tui) []const u8 {
+        return if (self.agent_filter) |agent| agent.label() else "all";
+    }
+
+    fn cycleAgentFilter(self: *Tui) void {
+        self.agent_filter = if (self.agent_filter) |agent| switch (agent) {
+            .claude => .codex,
+            .codex => .pi,
+            .pi => .opencode,
+            .opencode => null,
+        } else .claude;
+        self.recompute();
     }
 
     fn insertQueryByte(self: *Tui, c: u8) void {
@@ -818,4 +835,34 @@ test "selection changes reset preview and result scroll" {
 
     try testing.expectEqual(@as(usize, 0), tui.preview_scroll);
     try testing.expectEqual(@as(usize, 0), tui.result_scroll);
+}
+
+test "ctrl-t cycles interactive agent filter" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "s1", .text = "same", .ts = 1 },
+        .{ .agent = .opencode, .project = "p", .session = "s2", .text = "same", .ts = 2 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    tui.recompute();
+    try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
+    try testing.expectEqualStrings("all", tui.agentFilterLabel());
+
+    tui.cycleAgentFilter();
+    try testing.expectEqual(scan.Agent.claude, tui.agent_filter.?);
+    try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
+    try testing.expectEqual(scan.Agent.claude, records[tui.hits.items[0].idx].agent);
+
+    tui.cycleAgentFilter();
+    tui.cycleAgentFilter();
+    tui.cycleAgentFilter();
+    try testing.expectEqual(scan.Agent.opencode, tui.agent_filter.?);
+    try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
+    try testing.expectEqual(scan.Agent.opencode, records[tui.hits.items[0].idx].agent);
+
+    tui.cycleAgentFilter();
+    try testing.expect(tui.agent_filter == null);
+    try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
 }

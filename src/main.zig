@@ -26,7 +26,10 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(a);
     var print_project = false;
     var print_only = false;
-    for (args[1..]) |arg| {
+    var agent_filter: ?scan.Agent = null;
+    var arg_i: usize = 1;
+    while (arg_i < args.len) : (arg_i += 1) {
+        const arg = args[arg_i];
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
             try w.print("zehn {s} ({s})\n", .{ version, shortRev(git_rev) });
             try w.flush();
@@ -40,6 +43,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--project")) {
             print_project = true;
             print_only = true;
+        } else if (std.mem.eql(u8, arg, "--agent")) {
+            arg_i += 1;
+            if (arg_i >= args.len) return usageError(w, "--agent needs one of: claude, codex, pi, opencode");
+            agent_filter = parseAgent(args[arg_i]) orelse return usageError(w, "unknown agent");
+        } else if (std.mem.startsWith(u8, arg, "--agent=")) {
+            agent_filter = parseAgent(arg[8..]) orelse return usageError(w, "unknown agent");
+        } else if (parseAgentFlag(arg)) |agent| {
+            agent_filter = agent;
         } else if (std.mem.eql(u8, arg, "--print")) {
             print_only = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -53,6 +64,8 @@ pub fn main(init: std.process.Init) !void {
                 \\  zehn            find a prompt, then RESUME that session in its agent
                 \\  zehn --print    just print the selected prompt text (no resume)
                 \\  zehn --project  print agent<TAB>project<TAB>text (implies --print)
+                \\  zehn --agent claude   show only one agent (claude/codex/pi/opencode)
+                \\  zehn --claude         shorthand for --agent claude
                 \\  zehn update     update zehn from the latest master build
                 \\  zehn --list     dump all records
                 \\
@@ -61,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
                 \\(run from the session's project directory)
                 \\
                 \\Keys: type to filter · ↑/↓ or ^p/^n move · Enter resume
-                \\      ^f favorite (sorts to top) · ^y copy prompt · ^o fork into another agent
+                \\      ^t filter by tool · ^f favorite · ^y copy prompt · ^o fork into another agent
                 \\      Esc/^c quit
                 \\
                 \\Favorites are stored in $XDG_CONFIG_HOME/zehn/favorites (or ~/.config/zehn).
@@ -76,12 +89,18 @@ pub fn main(init: std.process.Init) !void {
 
     var sc = scan.Scanner.init(a, io, home);
     sc.scanAll();
+    if (agent_filter) |agent| filterRecordsByAgent(&sc.records, agent);
 
     if (sc.sqlite_missing) {
         std.debug.print("zehn: opencode history found but 'sqlite3' is not installed — skipping opencode sessions.\n", .{});
     }
 
     if (sc.records.items.len == 0) {
+        if (agent_filter) |agent| {
+            try w.print("zehn: no {s} history found\n", .{agent.label()});
+            try w.flush();
+            return;
+        }
         try w.writeAll("zehn: no history found\n");
         try w.flush();
         return;
@@ -114,6 +133,57 @@ pub fn main(init: std.process.Init) !void {
             .fork => try forkSession(init, io, w, rec, action.fork_agent),
         }
     }
+}
+
+fn usageError(w: *Io.Writer, msg: []const u8) !void {
+    try w.print("zehn: {s}\n", .{msg});
+    try w.writeAll("usage: zehn [--agent claude|codex|pi|opencode] [--print|--project|--list]\n");
+    try w.flush();
+}
+
+fn parseAgent(name: []const u8) ?scan.Agent {
+    inline for (.{ scan.Agent.claude, scan.Agent.codex, scan.Agent.pi, scan.Agent.opencode }) |agent| {
+        if (std.mem.eql(u8, name, agent.label())) return agent;
+    }
+    return null;
+}
+
+fn parseAgentFlag(arg: []const u8) ?scan.Agent {
+    if (!std.mem.startsWith(u8, arg, "--")) return null;
+    return parseAgent(arg[2..]);
+}
+
+fn filterRecordsByAgent(records: *std.ArrayList(scan.Record), agent: scan.Agent) void {
+    var out: usize = 0;
+    for (records.items) |rec| {
+        if (rec.agent == agent) {
+            records.items[out] = rec;
+            out += 1;
+        }
+    }
+    records.shrinkRetainingCapacity(out);
+}
+
+test "agent filter parsing accepts long and shorthand forms" {
+    try std.testing.expectEqual(scan.Agent.claude, parseAgent("claude").?);
+    try std.testing.expectEqual(scan.Agent.opencode, parseAgent("opencode").?);
+    try std.testing.expectEqual(scan.Agent.codex, parseAgentFlag("--codex").?);
+    try std.testing.expect(parseAgent("cursor") == null);
+}
+
+test "agent filter keeps only requested records" {
+    var records: std.ArrayList(scan.Record) = .empty;
+    defer records.deinit(std.testing.allocator);
+    try records.append(std.testing.allocator, .{ .agent = .claude, .text = "a", .project = "p", .session = "s", .ts = 1 });
+    try records.append(std.testing.allocator, .{ .agent = .opencode, .text = "b", .project = "p", .session = "s", .ts = 2 });
+    try records.append(std.testing.allocator, .{ .agent = .claude, .text = "c", .project = "p", .session = "s", .ts = 3 });
+
+    filterRecordsByAgent(&records, .claude);
+
+    try std.testing.expectEqual(@as(usize, 2), records.items.len);
+    try std.testing.expectEqual(scan.Agent.claude, records.items[0].agent);
+    try std.testing.expectEqualStrings("a", records.items[0].text);
+    try std.testing.expectEqualStrings("c", records.items[1].text);
 }
 
 fn shortRev(rev: []const u8) []const u8 {

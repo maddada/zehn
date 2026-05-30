@@ -77,12 +77,14 @@ If you do not want it to launch anything, the other modes just print:
 ```sh
 zehn --print     # print the prompt text of whatever you select
 zehn --project   # print  agent <tab> project <tab> text
+zehn --agent claude   # only show one agent: claude, codex, pi, or opencode
+zehn --opencode       # shorthand for --agent opencode
 zehn --list      # dump everything, no UI
 zehn update      # update to the latest master build
 zehn --version
 ```
 
-Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit. The search box has the usual readline-ish editing: left/right, Ctrl-left/right, Ctrl-U, Ctrl-K, Ctrl-backspace, and Ctrl-delete.
+Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit. Press `^t` to cycle the visible tools: all, claude, codex, pi, opencode. The search box has the usual readline-ish editing: left/right, Ctrl-left/right, Ctrl-U, Ctrl-K, Ctrl-backspace, and Ctrl-delete.
 
 Long prompts are a thing, especially if you use `/skill` blocks. Press Tab to focus the preview, PageUp/PageDown to scroll it, left/right to horizontally scroll the selected result, Ctrl-right/Ctrl-left to jump that result to the end/start, `W` to toggle wrapping, and `F` for a larger preview.
 
