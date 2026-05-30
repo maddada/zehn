@@ -99,6 +99,7 @@ pub const Tui = struct {
     hits: std.ArrayList(Hit) = .empty,
     sel: usize = 0,
     top: usize = 0,
+    preview_scroll: usize = 0,
     rows: u16 = 24,
     cols: u16 = 80,
     orig: posix.termios = undefined,
@@ -178,6 +179,7 @@ pub const Tui = struct {
         }.lt);
         self.sel = 0;
         self.top = 0;
+        self.preview_scroll = 0;
     }
 
     fn listHeight(self: *Tui) usize {
@@ -305,6 +307,11 @@ pub const Tui = struct {
             b.appendSlice(self.a, head) catch oom();
             // up to 4 lines, wrapped at display width, UTF-8 aware
             var i: usize = 0;
+            var skipped: usize = 0;
+            while (i < rec.text.len and skipped < self.preview_scroll) : (skipped += 1) {
+                while (i < rec.text.len and rec.text[i] != '\n') i += 1;
+                if (i < rec.text.len and rec.text[i] == '\n') i += 1;
+            }
             var line_lines: usize = 0;
             while (i < rec.text.len and line_lines < 4) {
                 var used: usize = 0;
@@ -378,40 +385,8 @@ pub const Tui = struct {
                 }
 
                 if (c == 27) {
-                    // escape sequence (arrows and readline-style modified keys) or bare ESC
-                    if (i + 2 < n and ibuf[i + 1] == '[') {
-                        if (ibuf[i + 2] == '3' and i + 5 < n and ibuf[i + 3] == ';' and ibuf[i + 4] == '5' and ibuf[i + 5] == '~') {
-                            self.deleteWordForward(); // ctrl-delete
-                            i += 6;
-                            continue;
-                        }
-                        if (i + 7 < n and ibuf[i + 2] == '1' and ibuf[i + 3] == '2' and ibuf[i + 4] == '7' and ibuf[i + 5] == ';' and ibuf[i + 6] == '5' and ibuf[i + 7] == 'u') {
-                            self.deleteWordBackward(); // ctrl-backspace (CSI u)
-                            i += 8;
-                            continue;
-                        }
-                        if (i + 5 < n and ibuf[i + 2] == '8' and ibuf[i + 3] == ';' and ibuf[i + 4] == '5' and ibuf[i + 5] == 'u') {
-                            self.deleteWordBackward(); // ctrl-backspace (CSI u)
-                            i += 6;
-                            continue;
-                        }
-                        if (i + 5 < n and ibuf[i + 2] == '1' and ibuf[i + 3] == ';' and ibuf[i + 4] == '5') {
-                            switch (ibuf[i + 5]) {
-                                'C' => self.moveWordRight(), // ctrl-right
-                                'D' => self.moveWordLeft(), // ctrl-left
-                                else => {},
-                            }
-                            i += 6;
-                            continue;
-                        }
-                        switch (ibuf[i + 2]) {
-                            'A' => self.moveUp(),
-                            'B' => self.moveDown(),
-                            'C' => self.moveRight(),
-                            'D' => self.moveLeft(),
-                            else => {},
-                        }
-                        i += 3;
+                    if (self.handleEscapeSequence(ibuf[i..n])) |consumed| {
+                        i += consumed;
                         continue;
                     }
                     return null; // bare ESC quits
@@ -468,6 +443,46 @@ pub const Tui = struct {
                 break;
             }
         }
+    }
+
+    fn handleEscapeSequence(self: *Tui, bytes: []const u8) ?usize {
+        if (bytes.len < 3 or bytes[0] != 27 or bytes[1] != '[') return null;
+        if (bytes[2] == '5' and bytes.len >= 4 and bytes[3] == '~') {
+            self.scrollPreview(-1);
+            return 4;
+        }
+        if (bytes[2] == '6' and bytes.len >= 4 and bytes[3] == '~') {
+            self.scrollPreview(1);
+            return 4;
+        }
+        if (bytes[2] == '3' and bytes.len >= 6 and bytes[3] == ';' and bytes[4] == '5' and bytes[5] == '~') {
+            self.deleteWordForward(); // ctrl-delete
+            return 6;
+        }
+        if (bytes.len >= 8 and bytes[2] == '1' and bytes[3] == '2' and bytes[4] == '7' and bytes[5] == ';' and bytes[6] == '5' and bytes[7] == 'u') {
+            self.deleteWordBackward(); // ctrl-backspace (CSI u)
+            return 8;
+        }
+        if (bytes.len >= 6 and bytes[2] == '8' and bytes[3] == ';' and bytes[4] == '5' and bytes[5] == 'u') {
+            self.deleteWordBackward(); // ctrl-backspace (CSI u)
+            return 6;
+        }
+        if (bytes.len >= 6 and bytes[2] == '1' and bytes[3] == ';' and bytes[4] == '5') {
+            switch (bytes[5]) {
+                'C' => self.moveWordRight(), // ctrl-right
+                'D' => self.moveWordLeft(), // ctrl-left
+                else => {},
+            }
+            return 6;
+        }
+        switch (bytes[2]) {
+            'A' => self.moveUp(),
+            'B' => self.moveDown(),
+            'C' => self.moveRight(),
+            'D' => self.moveLeft(),
+            else => {},
+        }
+        return 3;
     }
 
     fn writeQueryWithCursor(self: *Tui, b: *std.ArrayList(u8)) void {
@@ -572,12 +587,27 @@ pub const Tui = struct {
         self.deleteRange(self.query_cursor, end);
     }
 
+    fn scrollPreview(self: *Tui, delta: isize) void {
+        if (delta < 0) {
+            const d: usize = @intCast(-delta);
+            self.preview_scroll = if (d > self.preview_scroll) 0 else self.preview_scroll - d;
+        } else {
+            self.preview_scroll += @intCast(delta);
+        }
+    }
+
     fn moveDown(self: *Tui) void {
         if (self.hits.items.len == 0) return;
-        if (self.sel + 1 < self.hits.items.len) self.sel += 1;
+        if (self.sel + 1 < self.hits.items.len) {
+            self.sel += 1;
+            self.preview_scroll = 0;
+        }
     }
     fn moveUp(self: *Tui) void {
-        if (self.sel > 0) self.sel -= 1;
+        if (self.sel > 0) {
+            self.sel -= 1;
+            self.preview_scroll = 0;
+        }
     }
 };
 
@@ -642,4 +672,17 @@ test "query supports word movement and word deletion" {
     tui.query_cursor = tui.query.items.len;
     tui.deleteWordBackward();
     try testing.expectEqualStrings("one ", tui.query.items);
+}
+
+test "page up and down escape sequences scroll preview without typing tilde" {
+    var tui = testTui();
+    defer tui.query.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(?usize, 4), tui.handleEscapeSequence("\x1b[6~"));
+    try testing.expectEqual(@as(usize, 1), tui.preview_scroll);
+    try testing.expectEqualStrings("", tui.query.items);
+
+    try testing.expectEqual(@as(?usize, 4), tui.handleEscapeSequence("\x1b[5~"));
+    try testing.expectEqual(@as(usize, 0), tui.preview_scroll);
+    try testing.expectEqualStrings("", tui.query.items);
 }
