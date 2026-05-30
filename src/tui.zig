@@ -259,7 +259,7 @@ pub const Tui = struct {
         b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch oom();
         self.writeQueryWithCursor(b);
         var cnt: [128]u8 = undefined;
-        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  agent:{s}  ·  ^t filter  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len, self.agentFilterLabel() }) catch "\r\n";
+        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  ^t filter  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len }) catch "\r\n";
         b.appendSlice(self.a, cs) catch oom();
 
         const h = self.listHeight();
@@ -335,7 +335,7 @@ pub const Tui = struct {
         if (self.sel < self.hits.items.len) {
             const rec = self.records[self.hits.items[self.sel].idx];
             var pv: [256]u8 = undefined;
-            const head = std.fmt.bufPrint(&pv, "\x1b[90magent:\x1b[0m {s}  \x1b[90mproject:\x1b[0m {s}\r\n", .{ rec.agent.label(), if (rec.project.len > 0) rec.project else "-" }) catch "";
+            const head = std.fmt.bufPrint(&pv, "\x1b[90magent:\x1b[0m {s}  \x1b[90mfilter:\x1b[0m {s}  \x1b[90mproject:\x1b[0m {s}\r\n", .{ rec.agent.label(), self.agentFilterLabel(), if (rec.project.len > 0) rec.project else "-" }) catch "";
             b.appendSlice(self.a, head) catch oom();
             const preview_lines: usize = if (self.fullscreen_preview) self.rows -| 3 else 4;
             if (self.preview_focus) b.appendSlice(self.a, "\x1b[1;36mpreview\x1b[0m\r\n") catch oom();
