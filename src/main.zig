@@ -4,8 +4,10 @@ const scan = @import("scan.zig");
 const tui = @import("tui.zig");
 const favorites = @import("favorites.zig");
 const fork = @import("fork.zig");
+const build_options = @import("build_options");
 
 const version = "0.2.1";
+const git_rev = build_options.git_rev;
 
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
@@ -26,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     var print_only = false;
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
-            try w.print("zehn {s}\n", .{version});
+            try w.print("zehn {s} ({s})\n", .{ version, shortRev(git_rev) });
             try w.flush();
             return;
         } else if (std.mem.eql(u8, arg, "update")) {
@@ -70,6 +72,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    try checkForUpdate(init, w);
+
     var sc = scan.Scanner.init(a, io, home);
     sc.scanAll();
 
@@ -112,13 +116,45 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+fn shortRev(rev: []const u8) []const u8 {
+    if (rev.len > 12) return rev[0..12];
+    return rev;
+}
+
+fn remoteMasterCommand() []const u8 {
+    return "curl -fsSL --max-time 2 https://api.github.com/repos/al3rez/zehn/commits/master 2>/dev/null | sed -n 's/.*\"sha\": *\"\\([0-9a-f]*\\)\".*/\\1/p' | head -n1";
+}
+
+fn checkForUpdate(init: std.process.Init, w: *Io.Writer) !void {
+    _ = w;
+    if (std.mem.eql(u8, git_rev, "unknown")) return;
+    if (init.environ_map.get("ZEHN_NO_UPDATE_CHECK") != null) return;
+    const cmd = try std.fmt.allocPrint(init.arena.allocator(),
+        \\remote=$({s})
+        \\if [ -n "$remote" ] && [ "$remote" != "{s}" ]; then
+        \\  printf '\033[33mzehn: update available. Run `zehn update` to install latest master.\033[0m\n' >&2
+        \\fi
+    , .{ remoteMasterCommand(), git_rev });
+    var child = std.process.spawn(init.io, .{ .argv = &.{ "sh", "-c", cmd }, .stdout = .ignore, .stderr = .inherit, .environ_map = init.environ_map }) catch return;
+    _ = child.wait(init.io) catch return;
+}
+
 /// Re-run the official installer. It builds from the latest master and replaces
 /// the binary under $PREFIX/bin (default: ~/.local/bin), matching the install path.
 fn selfUpdate(init: std.process.Init, w: *Io.Writer) !void {
-    try w.writeAll("zehn: updating from https://github.com/al3rez/zehn ...\n");
+    const cmd = try std.fmt.allocPrint(init.arena.allocator(),
+        \\remote=$({s})
+        \\if [ -n "$remote" ] && [ "$remote" = "{s}" ]; then
+        \\  echo "zehn: already at latest master ({s})"
+        \\  exit 0
+        \\fi
+        \\curl -fsSL https://raw.githubusercontent.com/al3rez/zehn/master/scripts/install.sh | sh
+    , .{ remoteMasterCommand(), git_rev, shortRev(git_rev) });
+
+    try w.writeAll("zehn: checking https://github.com/al3rez/zehn ...\n");
     try w.flush();
     var child = std.process.spawn(init.io, .{
-        .argv = &.{ "sh", "-c", "curl -fsSL https://raw.githubusercontent.com/al3rez/zehn/master/scripts/install.sh | sh" },
+        .argv = &.{ "sh", "-c", cmd },
         .environ_map = init.environ_map,
     }) catch |err| {
         try w.print("zehn: failed to start updater ({t})\n", .{err});

@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const default_git_rev = std.mem.trim(u8, b.run(&.{ "sh", "-c", "git rev-parse HEAD 2>/dev/null || echo unknown" }), " \r\n");
+    const git_rev = b.option([]const u8, "git-rev", "git commit embedded in the binary") orelse default_git_rev;
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "git_rev", git_rev);
 
     const exe = b.addExecutable(.{
         .name = "zehn",
@@ -12,6 +17,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addOptions("build_options", options);
 
     b.installArtifact(exe);
 

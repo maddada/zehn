@@ -163,7 +163,8 @@ info "Cloning $REPO ..."
 git clone --depth 1 "$REPO" "$tmp/zehn"
 
 info "Building (ReleaseFast) ..."
-zig build -Doptimize=ReleaseFast --prefix "$PREFIX" --build-file "$tmp/zehn/build.zig"
+rev="$(git -C "$tmp/zehn" rev-parse HEAD 2>/dev/null || echo unknown)"
+zig build -Doptimize=ReleaseFast -Dgit-rev="$rev" --prefix "$PREFIX" --build-file "$tmp/zehn/build.zig"
 
 new_ver="$("$bin" --version 2>/dev/null | awk '{print $2}')"
 if [ -n "$old_ver" ] && [ "$old_ver" != "$new_ver" ]; then
