@@ -404,6 +404,15 @@ pub const Tui = struct {
                 // While picking an agent filter, digits choose the filter and any
                 // other key (esc included) cancels back to normal browsing.
                 if (self.filtering_agent) {
+                    if (c == 27) {
+                        if (self.handleEscapeSequence(ibuf[i..n])) |consumed| {
+                            i += consumed;
+                            continue;
+                        }
+                        self.filtering_agent = false;
+                        i += 1;
+                        continue;
+                    }
                     switch (c) {
                         13, 10 => {
                             self.applyFilterSelection();
@@ -436,7 +445,6 @@ pub const Tui = struct {
                         },
                         14 => self.moveFilterSelection(1), // ctrl-n
                         16 => self.moveFilterSelection(-1), // ctrl-p
-                        27 => self.filtering_agent = false,
                         else => {},
                     }
                     i += 1;
@@ -973,4 +981,14 @@ test "interactive agent filter picker filters hits" {
     tui.applyFilterSelection();
     try testing.expect(tui.agent_filter == null);
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
+}
+
+test "agent filter picker arrow keys move selection" {
+    var tui = testTui();
+    tui.openAgentFilterPicker();
+
+    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[B"));
+    try testing.expectEqual(@as(usize, 1), tui.filter_sel);
+    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[A"));
+    try testing.expectEqual(@as(usize, 0), tui.filter_sel);
 }
