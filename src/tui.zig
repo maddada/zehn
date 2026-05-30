@@ -116,6 +116,7 @@ pub const Tui = struct {
     forking: bool = false,
     /// When set, the preview area becomes an agent-filter picker.
     filtering_agent: bool = false,
+    filter_sel: usize = 0,
 
     pub fn init(a: std.mem.Allocator, io: Io, records: []const scan.Record, fav: *favorites.Set, fav_path: []const u8) Tui {
         return .{
@@ -313,9 +314,7 @@ pub const Tui = struct {
 
         // agent filter mode replaces the preview with a small picker
         if (self.filtering_agent) {
-            b.appendSlice(self.a, "\x1b[1;36mfilter by agent:\x1b[0m  ") catch oom();
-            b.appendSlice(self.a, "\x1b[1m0\x1b[0m all  \x1b[1m1\x1b[0m claude  \x1b[1m2\x1b[0m codex  \x1b[1m3\x1b[0m pi  \x1b[1m4\x1b[0m opencode") catch oom();
-            b.appendSlice(self.a, "  \x1b[90m(esc cancels)\x1b[0m\r\n") catch oom();
+            self.writeAgentFilterPicker(b);
             try w.writeAll(b.items);
             try w.flush();
             return;
@@ -405,13 +404,39 @@ pub const Tui = struct {
                 // While picking an agent filter, digits choose the filter and any
                 // other key (esc included) cancels back to normal browsing.
                 if (self.filtering_agent) {
-                    self.filtering_agent = false;
                     switch (c) {
-                        '0' => self.setAgentFilter(null),
-                        '1' => self.setAgentFilter(.claude),
-                        '2' => self.setAgentFilter(.codex),
-                        '3' => self.setAgentFilter(.pi),
-                        '4' => self.setAgentFilter(.opencode),
+                        13, 10 => {
+                            self.applyFilterSelection();
+                            self.filtering_agent = false;
+                        },
+                        '0' => {
+                            self.filter_sel = 0;
+                            self.applyFilterSelection();
+                            self.filtering_agent = false;
+                        },
+                        '1' => {
+                            self.filter_sel = 1;
+                            self.applyFilterSelection();
+                            self.filtering_agent = false;
+                        },
+                        '2' => {
+                            self.filter_sel = 2;
+                            self.applyFilterSelection();
+                            self.filtering_agent = false;
+                        },
+                        '3' => {
+                            self.filter_sel = 3;
+                            self.applyFilterSelection();
+                            self.filtering_agent = false;
+                        },
+                        '4' => {
+                            self.filter_sel = 4;
+                            self.applyFilterSelection();
+                            self.filtering_agent = false;
+                        },
+                        14 => self.moveFilterSelection(1), // ctrl-n
+                        16 => self.moveFilterSelection(-1), // ctrl-p
+                        27 => self.filtering_agent = false,
                         else => {},
                     }
                     i += 1;
@@ -466,7 +491,7 @@ pub const Tui = struct {
                         if (self.sel < self.hits.items.len) self.forking = true;
                     },
                     11 => self.killToEnd(), // ctrl-k
-                    20 => self.filtering_agent = true, // ctrl-t
+                    20 => self.openAgentFilterPicker(), // ctrl-t
                     21 => self.killToBeginning(), // ctrl-u
                     87, 119 => { // w/W
                         if (self.preview_focus) self.wrap_preview = !self.wrap_preview else self.insertQueryByte(c);
@@ -544,8 +569,8 @@ pub const Tui = struct {
             return 6;
         }
         switch (bytes[2]) {
-            'A' => self.moveUp(),
-            'B' => self.moveDown(),
+            'A' => if (self.filtering_agent) self.moveFilterSelection(-1) else self.moveUp(),
+            'B' => if (self.filtering_agent) self.moveFilterSelection(1) else self.moveDown(),
             'C' => if (self.preview_focus) self.scrollResult(8) else self.moveRight(),
             'D' => if (self.preview_focus) self.scrollResult(-8) else self.moveLeft(),
             else => {},
@@ -598,6 +623,54 @@ pub const Tui = struct {
 
     fn agentFilterLabel(self: *const Tui) []const u8 {
         return if (self.agent_filter) |agent| agent.label() else "all";
+    }
+
+    fn filterSelectionAgent(sel: usize) ?scan.Agent {
+        return switch (sel) {
+            0 => null,
+            1 => .claude,
+            2 => .codex,
+            3 => .pi,
+            4 => .opencode,
+            else => null,
+        };
+    }
+
+    fn agentFilterSelection(self: *const Tui) usize {
+        return if (self.agent_filter) |agent| switch (agent) {
+            .claude => 1,
+            .codex => 2,
+            .pi => 3,
+            .opencode => 4,
+        } else 0;
+    }
+
+    fn openAgentFilterPicker(self: *Tui) void {
+        self.filtering_agent = true;
+        self.filter_sel = self.agentFilterSelection();
+    }
+
+    fn moveFilterSelection(self: *Tui, delta: isize) void {
+        if (delta < 0) {
+            self.filter_sel = if (self.filter_sel == 0) 4 else self.filter_sel - 1;
+        } else {
+            self.filter_sel = (self.filter_sel + 1) % 5;
+        }
+    }
+
+    fn applyFilterSelection(self: *Tui) void {
+        self.setAgentFilter(filterSelectionAgent(self.filter_sel));
+    }
+
+    fn writeAgentFilterPicker(self: *Tui, b: *std.ArrayList(u8)) void {
+        b.appendSlice(self.a, "\x1b[1;36mfilter by agent:\x1b[0m\r\n") catch oom();
+        const labels = [_][]const u8{ "all", "claude", "codex", "pi", "opencode" };
+        for (labels, 0..) |label, idx| {
+            if (idx == self.filter_sel) b.appendSlice(self.a, "\x1b[7m") catch oom();
+            b.print(self.a, "  {d} {s}  ", .{ idx, label }) catch oom();
+            if (idx == self.filter_sel) b.appendSlice(self.a, "\x1b[0m") catch oom();
+        }
+        b.appendSlice(self.a, "\r\n\x1b[90m↑/↓ or ^p/^n move · Enter select · 0-4 quick select · Esc cancel\x1b[0m\r\n") catch oom();
     }
 
     fn cycleAgentFilter(self: *Tui) void {
@@ -882,17 +955,22 @@ test "interactive agent filter picker filters hits" {
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
     try testing.expectEqualStrings("all", tui.agentFilterLabel());
 
-    tui.setAgentFilter(.claude);
+    tui.openAgentFilterPicker();
+    tui.moveFilterSelection(1);
+    try testing.expectEqual(@as(usize, 1), tui.filter_sel);
+    tui.applyFilterSelection();
     try testing.expectEqual(scan.Agent.claude, tui.agent_filter.?);
     try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
     try testing.expectEqual(scan.Agent.claude, records[tui.hits.items[0].idx].agent);
 
-    tui.setAgentFilter(.opencode);
+    tui.filter_sel = 4;
+    tui.applyFilterSelection();
     try testing.expectEqual(scan.Agent.opencode, tui.agent_filter.?);
     try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
     try testing.expectEqual(scan.Agent.opencode, records[tui.hits.items[0].idx].agent);
 
-    tui.setAgentFilter(null);
+    tui.filter_sel = 0;
+    tui.applyFilterSelection();
     try testing.expect(tui.agent_filter == null);
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
 }
