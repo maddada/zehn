@@ -270,22 +270,31 @@ pub const Tui = struct {
             const hit = self.hits.items[hi];
             const rec = self.records[hit.idx];
             const selected = hi == self.sel;
-            if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
-            b.appendSlice(self.a, if (selected) "▌ " else "  ") catch oom();
+            if (selected) {
+                b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
+                b.appendSlice(self.a, "▌\x1b[0m\x1b[7m ") catch oom();
+            } else {
+                b.appendSlice(self.a, "  ") catch oom();
+            }
             // favorite marker (bold yellow star), or a blank to keep columns aligned
             if (hit.fav) {
-                b.appendSlice(self.a, "\x1b[1;33m★\x1b[0m") catch oom();
+                if (selected) {
+                    b.appendSlice(self.a, "★") catch oom();
+                } else {
+                    b.appendSlice(self.a, "\x1b[1;33m★\x1b[0m") catch oom();
+                }
                 if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
             } else {
                 b.append(self.a, ' ') catch oom();
             }
             b.append(self.a, ' ') catch oom();
-            // agent tag
-            b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
+            // Agent colors look muddy under reverse-video selection in several
+            // terminals, so selected rows keep one plain inverted style.
+            if (!selected) b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
             var tag: [16]u8 = undefined;
             const ts = std.fmt.bufPrint(&tag, "{s: <7}", .{rec.agent.label()}) catch rec.agent.label();
             b.appendSlice(self.a, ts) catch oom();
-            b.appendSlice(self.a, "\x1b[0m") catch oom();
+            if (!selected) b.appendSlice(self.a, "\x1b[0m") catch oom();
             if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
             b.append(self.a, ' ') catch oom();
             self.writeHighlighted(b, rec.text, hit.m, text_max, selected);
