@@ -311,7 +311,7 @@ pub const Tui = struct {
         // separator
         b.appendSlice(self.a, "\x1b[90m") catch oom();
         var k: usize = 0;
-        while (k < self.cols) : (k += 1) b.append(self.a, '-') catch oom();
+        while (k < self.cols) : (k += 1) b.appendSlice(self.a, "─") catch oom();
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
 
         // agent filter mode replaces the preview with a small picker
