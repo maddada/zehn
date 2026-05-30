@@ -629,8 +629,11 @@ pub const Tui = struct {
         if (rec.meta.plan.len > 0) b.print(self.a, "({s}) ", .{rec.meta.plan}) catch oom();
         if (rec.meta.usage.rate_percent > 0) b.print(self.a, "{d:.1}%", .{rec.meta.usage.rate_percent}) catch oom();
         if (rec.meta.usage.context_window > 0) b.print(self.a, "/{d} ", .{rec.meta.usage.context_window}) catch oom();
-        b.print(self.a, "({s})", .{if (rec.meta.provider.len > 0) rec.meta.provider else rec.agent.label()}) catch oom();
-        if (rec.meta.model.len > 0) b.print(self.a, " {s}", .{rec.meta.model}) catch oom();
+        if (rec.meta.provider.len > 0) b.print(self.a, "({s})", .{rec.meta.provider}) catch oom();
+        if (rec.meta.model.len > 0) {
+            if (rec.meta.provider.len > 0) b.append(self.a, ' ') catch oom();
+            b.print(self.a, "{s}", .{rec.meta.model}) catch oom();
+        }
         if (rec.meta.thinking.len > 0) b.print(self.a, " • {s}", .{rec.meta.thinking}) catch oom();
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
     }
