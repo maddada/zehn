@@ -8,14 +8,15 @@ const uni = @import("unicode.zig");
 const favorites = @import("favorites.zig");
 
 /// What the user chose to do with the selected record. `resume` is the default
-/// (Enter); `copy` puts the prompt on the clipboard; `fork` starts a fresh
-/// session with the prompt in `fork_agent` (possibly a different agent).
+/// (Enter); `copy` puts the prompt on the clipboard; `view` opens it in
+/// $EDITOR; `fork` starts a fresh session with the prompt in `fork_agent`
+/// (possibly a different agent).
 pub const Action = struct {
     idx: usize,
     kind: Kind,
     fork_agent: scan.Agent = .claude,
 
-    pub const Kind = enum { resume_session, copy, fork };
+    pub const Kind = enum { resume_session, copy, view, fork };
 };
 
 // TIOCGWINSZ is platform-specific: the Linux value differs from the BSD/Darwin
@@ -267,6 +268,19 @@ pub const Tui = struct {
         }
     }
 
+    // Write the assembled frame, dropping a single trailing newline first. The
+    // frame is sized to fill the terminal exactly, so a final CRLF would push
+    // the cursor one row below the bottom and scroll the whole alt screen up —
+    // sweeping the sticky `❯` prompt off the top. Leaving the cursor parked on
+    // the last row keeps row 1 (the prompt) pinned, since render() always
+    // redraws from a clear+home.
+    fn flushFrame(_: *Tui, w: *Io.Writer, b: *std.ArrayList(u8)) !void {
+        var items = b.items;
+        if (std.mem.endsWith(u8, items, "\r\n")) items = items[0 .. items.len - 2];
+        try w.writeAll(items);
+        try w.flush();
+    }
+
     fn render(self: *Tui, w: *Io.Writer) !void {
         self.winsize(); // pick up live terminal resizes
         self.clampScroll();
@@ -276,12 +290,7 @@ pub const Tui = struct {
 
         b.appendSlice(self.a, "\x1b[2J\x1b[H") catch oom(); // clear + home
 
-        // prompt line
-        b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch oom();
-        self.writeQueryWithCursor(b);
-        var cnt: [128]u8 = undefined;
-        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  ^t agents  ^r projects  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len }) catch "\r\n";
-        b.appendSlice(self.a, cs) catch oom();
+        self.writePromptLine(b);
 
         const h = self.listHeight();
         const text_max: usize = if (self.cols > 16) self.cols - 16 else 20;
@@ -329,21 +338,20 @@ pub const Tui = struct {
         // separator
         b.appendSlice(self.a, "\x1b[90m") catch oom();
         var k: usize = 0;
-        while (k < self.cols) : (k += 1) b.appendSlice(self.a, "─") catch oom();
+        const sep_cols = @max(@as(usize, 1), @as(usize, self.cols) -| 1);
+        while (k < sep_cols) : (k += 1) b.appendSlice(self.a, "─") catch oom();
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
 
         if (self.filtering_project) {
             self.writeProjectFilterPicker(b, self.bottomRowsAfterList(h));
-            try w.writeAll(b.items);
-            try w.flush();
+            try self.flushFrame(w, b);
             return;
         }
 
         // agent filter mode replaces the preview with a small picker
         if (self.filtering_agent) {
             self.writeAgentFilterPicker(b, self.bottomRowsAfterList(h));
-            try w.writeAll(b.items);
-            try w.flush();
+            try self.flushFrame(w, b);
             return;
         }
 
@@ -352,8 +360,7 @@ pub const Tui = struct {
             b.appendSlice(self.a, "\x1b[1;36mfork prompt into:\x1b[0m  ") catch oom();
             b.appendSlice(self.a, "\x1b[1m1\x1b[0m claude  \x1b[1m2\x1b[0m codex  \x1b[1m3\x1b[0m pi  \x1b[1m4\x1b[0m opencode") catch oom();
             b.appendSlice(self.a, "  \x1b[90m(esc cancels)\x1b[0m\r\n") catch oom();
-            try w.writeAll(b.items);
-            try w.flush();
+            try self.flushFrame(w, b);
             return;
         }
 
@@ -362,9 +369,11 @@ pub const Tui = struct {
             const rec = self.records[self.hits.items[self.sel].idx];
             const bottom_rows = self.bottomRowsAfterList(h);
             self.writeProjectLine(b, rec);
-            const fixed_rows: usize = 3; // project line + blank + metadata line
+            const has_preview_title = self.preview_focus and bottom_rows > 4;
+            const fixed_rows: usize = 3 + @as(usize, @intFromBool(has_preview_title)); // project line + blank + optional title + metadata line
             const preview_lines: usize = if (bottom_rows > fixed_rows) bottom_rows - fixed_rows else 1;
-            if (self.preview_focus and preview_lines > 1) b.appendSlice(self.a, "\x1b[1;36mpreview\x1b[0m\r\n") catch oom();
+            const preview_cols = @max(@as(usize, 1), @as(usize, self.cols) -| 1);
+            if (has_preview_title) b.appendSlice(self.a, "\x1b[1;36mpreview\x1b[0m\r\n") catch oom();
             // preview lines, wrapped at display width when enabled, UTF-8 aware
             var i: usize = 0;
             var skipped: usize = 0;
@@ -376,22 +385,31 @@ pub const Tui = struct {
             while (i < rec.text.len and line_lines < preview_lines) {
                 var used: usize = 0;
                 const line_start = i;
+                var filled = false; // a wrap already consumed the last budgeted row
                 while (i < rec.text.len) {
                     if (rec.text[i] == '\n') break;
                     const d = uni.decode(rec.text[i..]);
                     const is_ctrl = d.cp < 0x20 or (d.cp >= 0x7f and d.cp < 0xa0);
                     const cw: usize = if (is_ctrl) 1 else uni.charWidth(d.cp);
-                    if (used + cw > self.cols) {
+                    if (used + cw > preview_cols) {
                         if (!self.wrap_preview) break;
                         b.appendSlice(self.a, "\r\n") catch oom();
                         line_lines += 1;
                         used = 0;
-                        if (line_lines >= preview_lines) break;
+                        if (line_lines >= preview_lines) {
+                            filled = true;
+                            break;
+                        }
                     }
                     if (is_ctrl) b.append(self.a, ' ') catch oom() else b.appendSlice(self.a, rec.text[i .. i + d.len]) catch oom();
                     used += cw;
                     i += d.len;
                 }
+                // The wrap above already emitted this row's newline and counted it.
+                // Emitting the line terminator again would make the frame one line
+                // taller than the terminal, scrolling the prompt and first row off
+                // the top of the alt screen.
+                if (filled) break;
                 b.appendSlice(self.a, "\r\n") catch oom();
                 // if we stopped on a newline, skip it
                 if (i < rec.text.len and rec.text[i] == '\n') i += 1;
@@ -401,8 +419,7 @@ pub const Tui = struct {
             self.writeMetadataLine(b, rec);
         }
 
-        try w.writeAll(b.items);
-        try w.flush();
+        try self.flushFrame(w, b);
     }
 
     /// Returns the chosen Action, or null if cancelled.
@@ -533,6 +550,10 @@ pub const Tui = struct {
                     6 => { // ctrl-f
                         if (self.preview_focus) self.fullscreen_preview = !self.fullscreen_preview else self.toggleFavorite();
                     },
+                    5 => { // ctrl-e: open selected prompt in $EDITOR
+                        if (self.sel < self.hits.items.len)
+                            return .{ .idx = self.hits.items[self.sel].idx, .kind = .view };
+                    },
                     25 => { // ctrl-y: copy selected to clipboard
                         if (self.sel < self.hits.items.len)
                             return .{ .idx = self.hits.items[self.sel].idx, .kind = .copy };
@@ -630,9 +651,41 @@ pub const Tui = struct {
         return 3;
     }
 
-    fn writeQueryWithCursor(self: *Tui, b: *std.ArrayList(u8)) void {
+    fn writePromptLine(self: *Tui, b: *std.ArrayList(u8)) void {
+        const prefix_cols: usize = 2;
+        const status_cols: usize = if (self.cols >= 96)
+            2 + countDigits(self.hits.items.len) + 1 + countDigits(self.records.len) + 62
+        else if (self.cols >= 64)
+            2 + countDigits(self.hits.items.len) + 1 + countDigits(self.records.len) + 22
+        else
+            2 + countDigits(self.hits.items.len) + 1 + countDigits(self.records.len);
+        // Keep one column spare before CRLF. Many terminals auto-wrap as soon as
+        // the cursor reaches the last column, which adds a physical line and can
+        // scroll the sticky prompt off the top of the alt screen.
+        const line_cols = @max(@as(usize, 1), @as(usize, self.cols) -| 1);
+        const query_max = @max(@as(usize, 1), line_cols -| (prefix_cols + status_cols));
+
+        b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch oom();
+        self.writeQueryWithCursor(b, query_max);
+        if (self.cols >= 96) {
+            b.print(self.a, "  \x1b[90m{d}/{d}  ·  ^t agents  ^r projects  ^f fav  ^e view  ^y copy  ^o fork\x1b[0m", .{ self.hits.items.len, self.records.len }) catch oom();
+        } else if (self.cols >= 64) {
+            b.print(self.a, "  \x1b[90m{d}/{d}  ·  ^t ^r ^f ^e ^y ^o\x1b[0m", .{ self.hits.items.len, self.records.len }) catch oom();
+        } else {
+            b.print(self.a, "  \x1b[90m{d}/{d}\x1b[0m", .{ self.hits.items.len, self.records.len }) catch oom();
+        }
+        b.appendSlice(self.a, "\r\n") catch oom();
+    }
+
+    fn countDigits(n: usize) usize {
+        var x = n;
+        var digits: usize = 1;
+        while (x >= 10) : (digits += 1) x /= 10;
+        return digits;
+    }
+
+    fn writeQueryWithCursor(self: *Tui, b: *std.ArrayList(u8), max: usize) void {
         const q = self.query.items;
-        const max: usize = if (self.cols > 44) self.cols - 44 else 20;
         var start: usize = 0;
         if (self.query_cursor > max / 2) start = self.query_cursor - max / 2;
         while (start < q.len and (q[start] & 0xC0) == 0x80) start += 1;
@@ -674,13 +727,18 @@ pub const Tui = struct {
     }
 
     fn writeProjectLine(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record) void {
+        const max_cols = @max(@as(usize, 1), @as(usize, self.cols) -| 1);
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.a);
         const project = if (rec.project.len > 0) rec.project else "-";
-        b.appendSlice(self.a, "\x1b[90m") catch oom();
-        b.appendSlice(self.a, project) catch oom();
-        if (self.gitBranch(rec.project)) |branch| b.print(self.a, " ({s})", .{branch}) catch oom();
+        line.appendSlice(self.a, project) catch oom();
+        if (self.gitBranch(rec.project)) |branch| line.print(self.a, " ({s})", .{branch}) catch oom();
         const pos = if (self.hits.items.len == 0) 0 else self.sel + 1;
-        b.print(self.a, "  {d}/{d}", .{ pos, self.hits.items.len }) catch oom();
-        self.writeAgentFilterStatus(b);
+        line.print(self.a, "  {d}/{d}", .{ pos, self.hits.items.len }) catch oom();
+        self.appendAgentFilterStatusPlain(&line);
+
+        b.appendSlice(self.a, "\x1b[90m") catch oom();
+        self.appendPlainTruncated(b, line.items, max_cols);
         b.appendSlice(self.a, "\x1b[0m\r\n\r\n") catch oom();
     }
 
@@ -717,7 +775,24 @@ pub const Tui = struct {
         if (u.cost > 0) b.print(self.a, "${d:.3} ", .{u.cost}) catch oom();
     }
 
-    fn writeAgentFilterStatus(self: *Tui, b: *std.ArrayList(u8)) void {
+    fn appendPlainTruncated(self: *Tui, b: *std.ArrayList(u8), text: []const u8, max_cols: usize) void {
+        var used: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            const d = uni.decode(text[i..]);
+            const is_ctrl = d.cp < 0x20 or (d.cp >= 0x7f and d.cp < 0xa0);
+            const cw: usize = if (is_ctrl) 1 else uni.charWidth(d.cp);
+            if (used + cw > max_cols) {
+                if (max_cols > 0) b.appendSlice(self.a, "…") catch oom();
+                return;
+            }
+            if (is_ctrl) b.append(self.a, ' ') catch oom() else b.appendSlice(self.a, text[i .. i + d.len]) catch oom();
+            used += cw;
+            i += d.len;
+        }
+    }
+
+    fn appendAgentFilterStatusPlain(self: *Tui, b: *std.ArrayList(u8)) void {
         if (self.agent_filter_mask == 0) return;
         b.appendSlice(self.a, "  agents:") catch oom();
         var first = true;
@@ -728,6 +803,10 @@ pub const Tui = struct {
             b.appendSlice(self.a, agent.label()) catch oom();
             first = false;
         }
+    }
+
+    fn writeAgentFilterStatus(self: *Tui, b: *std.ArrayList(u8)) void {
+        self.appendAgentFilterStatusPlain(b);
     }
 
     fn agentBit(agent: scan.Agent) u4 {
@@ -1010,6 +1089,30 @@ fn testTui() Tui {
     return Tui.init(testing.allocator, undefined, &.{}, undefined, "");
 }
 
+fn visibleColsNoAnsi(s: []const u8) usize {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == 0x1b) {
+            i += 1;
+            if (i < s.len and s[i] == '[') {
+                i += 1;
+                while (i < s.len and (s[i] < '@' or s[i] > '~')) i += 1;
+                if (i < s.len) i += 1;
+            }
+            continue;
+        }
+        if (s[i] == '\r' or s[i] == '\n') {
+            i += 1;
+            continue;
+        }
+        const d = uni.decode(s[i..]);
+        cols += uni.charWidth(d.cp);
+        i += d.len;
+    }
+    return cols;
+}
+
 test "query render keeps typed search text visible with cursor" {
     var tui = testTui();
     defer tui.query.deinit(testing.allocator);
@@ -1019,10 +1122,39 @@ test "query render keeps typed search text visible with cursor" {
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
-    tui.writeQueryWithCursor(&out);
+    tui.writeQueryWithCursor(&out, 20);
 
     try testing.expect(std.mem.indexOf(u8, out.items, "abcdef") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[7m \x1b[0m") != null);
+}
+
+test "prompt line stays within terminal width" {
+    var tui = testTui();
+    defer tui.query.deinit(testing.allocator);
+    tui.cols = 80;
+    try tui.query.appendSlice(testing.allocator, "this is a deliberately long search that used to push the help text past the edge");
+    tui.query_cursor = tui.query.items.len;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    tui.writePromptLine(&out);
+
+    try testing.expect(visibleColsNoAnsi(out.items) < tui.cols);
+    try testing.expect(std.mem.endsWith(u8, out.items, "\r\n"));
+}
+
+test "prompt line keeps spare column to avoid terminal autowrap" {
+    var tui = testTui();
+    defer tui.query.deinit(testing.allocator);
+    tui.cols = 20;
+    try tui.query.appendSlice(testing.allocator, "a long query that must not hit the last terminal column");
+    tui.query_cursor = tui.query.items.len;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    tui.writePromptLine(&out);
+
+    try testing.expect(visibleColsNoAnsi(out.items) < tui.cols);
 }
 
 test "query supports readline-style character and line editing" {

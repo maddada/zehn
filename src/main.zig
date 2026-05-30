@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const scan = @import("scan.zig");
 const tui = @import("tui.zig");
@@ -74,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
                 \\(run from the session's project directory)
                 \\
                 \\Keys: type to filter · ↑/↓ or ^p/^n move · Enter resume
-                \\      ^t agents · ^r projects · ^f favorite · ^y copy · ^o fork
+                \\      ^t agents · ^r projects · ^f favorite · ^e view · ^y copy · ^o fork
                 \\      Esc/^c quit
                 \\
                 \\Favorites are stored in $XDG_CONFIG_HOME/zehn/favorites (or ~/.config/zehn).
@@ -130,6 +131,7 @@ pub fn main(init: std.process.Init) !void {
         switch (action.kind) {
             .resume_session => try resumeSession(init, io, w, rec),
             .copy => try copyPrompt(io, w, rec),
+            .view => try viewPrompt(init, io, w, rec),
             .fork => try forkSession(init, io, w, rec, action.fork_agent),
         }
     }
@@ -236,6 +238,35 @@ fn selfUpdate(init: std.process.Init, w: *Io.Writer) !void {
         try w.writeAll("zehn: update failed\n");
         try w.flush();
     }
+}
+
+fn viewPrompt(init: std.process.Init, io: Io, w: *Io.Writer, rec: scan.Record) !void {
+    const editor = init.environ_map.get("EDITOR") orelse init.environ_map.get("VISUAL") orelse "nvim";
+    const tmp = init.environ_map.get("TMPDIR") orelse "/tmp";
+    const pid = switch (builtin.os.tag) {
+        .linux => std.os.linux.getpid(),
+        else => std.c.getpid(),
+    };
+    const path = try std.fmt.allocPrint(init.arena.allocator(), "{s}/zehn-prompt-{d}.md", .{ tmp, pid });
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = rec.text }) catch |err| {
+        try w.print("zehn: failed to write preview file ({t})\n", .{err});
+        try w.flush();
+        return;
+    };
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{ editor, path },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .environ_map = init.environ_map,
+    }) catch |err| {
+        try w.print("zehn: failed to launch editor `{s}` ({t}); set $EDITOR if needed\n", .{ editor, err });
+        try w.flush();
+        return;
+    };
+    _ = try child.wait(io);
 }
 
 /// Copy the prompt text to the system clipboard, trying each platform tool in
