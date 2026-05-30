@@ -618,14 +618,18 @@ pub const Tui = struct {
     }
 
     fn writeStatusLine(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record) void {
-        const project = if (rec.project.len > 0) std.fs.path.basename(rec.project) else "-";
+        const project = if (rec.project.len > 0) rec.project else "-";
         const pos = if (self.hits.items.len == 0) 0 else self.sel + 1;
-        b.print(self.a, "\x1b[90m{s}  {d}/{d}  filter:{s}  ", .{ project, pos, self.hits.items.len, self.agentFilterLabel() }) catch oom();
+        b.print(self.a, "\x1b[90m{s}  {d}/{d}", .{ project, pos, self.hits.items.len }) catch oom();
+        self.writeAgentFilterStatus(b);
+        b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+
+        b.appendSlice(self.a, "\x1b[90m") catch oom();
         self.writeUsageStatus(b, rec.meta.usage);
-        if (rec.meta.plan.len > 0) b.print(self.a, " ({s})", .{rec.meta.plan}) catch oom();
-        if (rec.meta.usage.rate_percent > 0) b.print(self.a, " {d:.1}%", .{rec.meta.usage.rate_percent}) catch oom();
-        if (rec.meta.usage.context_window > 0) b.print(self.a, "/{d}", .{rec.meta.usage.context_window}) catch oom();
-        b.print(self.a, "  ({s})", .{if (rec.meta.provider.len > 0) rec.meta.provider else rec.agent.label()}) catch oom();
+        if (rec.meta.plan.len > 0) b.print(self.a, "({s}) ", .{rec.meta.plan}) catch oom();
+        if (rec.meta.usage.rate_percent > 0) b.print(self.a, "{d:.1}%", .{rec.meta.usage.rate_percent}) catch oom();
+        if (rec.meta.usage.context_window > 0) b.print(self.a, "/{d} ", .{rec.meta.usage.context_window}) catch oom();
+        b.print(self.a, "({s})", .{if (rec.meta.provider.len > 0) rec.meta.provider else rec.agent.label()}) catch oom();
         if (rec.meta.model.len > 0) b.print(self.a, " {s}", .{rec.meta.model}) catch oom();
         if (rec.meta.thinking.len > 0) b.print(self.a, " • {s}", .{rec.meta.thinking}) catch oom();
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
@@ -639,6 +643,19 @@ pub const Tui = struct {
         if (u.cost > 0) b.print(self.a, "${d:.3} ", .{u.cost}) catch oom();
     }
 
+    fn writeAgentFilterStatus(self: *Tui, b: *std.ArrayList(u8)) void {
+        if (self.agent_filter_mask == 0) return;
+        b.appendSlice(self.a, "  agents:") catch oom();
+        var first = true;
+        const agents = [_]scan.Agent{ .claude, .codex, .pi, .opencode };
+        for (agents) |agent| {
+            if ((self.agent_filter_mask & agentBit(agent)) == 0) continue;
+            if (!first) b.append(self.a, ',') catch oom();
+            b.appendSlice(self.a, agent.label()) catch oom();
+            first = false;
+        }
+    }
+
     fn agentBit(agent: scan.Agent) u4 {
         return switch (agent) {
             .claude => 1 << 0,
@@ -650,10 +667,6 @@ pub const Tui = struct {
 
     fn agentAllowed(self: *const Tui, agent: scan.Agent) bool {
         return self.agent_filter_mask == 0 or (self.agent_filter_mask & agentBit(agent)) != 0;
-    }
-
-    fn agentFilterLabel(self: *const Tui) []const u8 {
-        return if (self.agent_filter_mask == 0) "none" else "custom";
     }
 
     fn openAgentFilterPicker(self: *Tui) void {
@@ -955,7 +968,7 @@ test "interactive agent filter picker filters hits" {
     defer tui.hits.deinit(testing.allocator);
     tui.recompute();
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
-    try testing.expectEqualStrings("none", tui.agentFilterLabel());
+    try testing.expectEqual(@as(u4, 0), tui.agent_filter_mask);
 
     tui.openAgentFilterPicker();
     try testing.expectEqual(@as(usize, 0), tui.filter_sel);
