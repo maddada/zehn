@@ -665,7 +665,7 @@ pub const Tui = struct {
             const selected = (self.agent_filter_mask & agentBit(agent)) != 0;
             b.print(self.a, "\x1b[90m{s}\x1b[0m\r\n", .{if (selected) " ✓" else ""}) catch oom();
         }
-        b.appendSlice(self.a, "\r\n\x1b[90mNo checks = no agent filter\x1b[0m\r\n") catch oom();
+        b.appendSlice(self.a, "\r\n\x1b[90mSelect none to show all agents.\x1b[0m\r\n") catch oom();
         b.appendSlice(self.a, "\r\n\x1b[90m↑/↓ or ^p/^n move · Enter/Space toggle · 1-4 quick toggle · Esc close\x1b[0m\r\n") catch oom();
     }
 
