@@ -114,6 +114,8 @@ pub const Tui = struct {
     /// When set, the picker is in "fork into which agent?" mode and digit keys
     /// choose the target instead of typing into the query.
     forking: bool = false,
+    /// When set, the preview area becomes an agent-filter picker.
+    filtering_agent: bool = false,
 
     pub fn init(a: std.mem.Allocator, io: Io, records: []const scan.Record, fav: *favorites.Set, fav_path: []const u8) Tui {
         return .{
@@ -257,7 +259,7 @@ pub const Tui = struct {
         b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch oom();
         self.writeQueryWithCursor(b);
         var cnt: [128]u8 = undefined;
-        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  tool:{s}  ·  ^t filter  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len, self.agentFilterLabel() }) catch "\r\n";
+        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  agent:{s}  ·  ^t filter  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len, self.agentFilterLabel() }) catch "\r\n";
         b.appendSlice(self.a, cs) catch oom();
 
         const h = self.listHeight();
@@ -308,6 +310,16 @@ pub const Tui = struct {
         var k: usize = 0;
         while (k < self.cols) : (k += 1) b.append(self.a, '-') catch oom();
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+
+        // agent filter mode replaces the preview with a small picker
+        if (self.filtering_agent) {
+            b.appendSlice(self.a, "\x1b[1;36mfilter by agent:\x1b[0m  ") catch oom();
+            b.appendSlice(self.a, "\x1b[1m0\x1b[0m all  \x1b[1m1\x1b[0m claude  \x1b[1m2\x1b[0m codex  \x1b[1m3\x1b[0m pi  \x1b[1m4\x1b[0m opencode") catch oom();
+            b.appendSlice(self.a, "  \x1b[90m(esc cancels)\x1b[0m\r\n") catch oom();
+            try w.writeAll(b.items);
+            try w.flush();
+            return;
+        }
 
         // fork mode replaces the preview with an agent picker
         if (self.forking) {
@@ -390,6 +402,22 @@ pub const Tui = struct {
             while (i < n) {
                 const c = ibuf[i];
 
+                // While picking an agent filter, digits choose the filter and any
+                // other key (esc included) cancels back to normal browsing.
+                if (self.filtering_agent) {
+                    self.filtering_agent = false;
+                    switch (c) {
+                        '0' => self.setAgentFilter(null),
+                        '1' => self.setAgentFilter(.claude),
+                        '2' => self.setAgentFilter(.codex),
+                        '3' => self.setAgentFilter(.pi),
+                        '4' => self.setAgentFilter(.opencode),
+                        else => {},
+                    }
+                    i += 1;
+                    continue;
+                }
+
                 // While picking a fork target, digits choose the agent and any
                 // other key (esc included) cancels back to normal browsing.
                 if (self.forking) {
@@ -438,7 +466,7 @@ pub const Tui = struct {
                         if (self.sel < self.hits.items.len) self.forking = true;
                     },
                     11 => self.killToEnd(), // ctrl-k
-                    20 => self.cycleAgentFilter(), // ctrl-t
+                    20 => self.filtering_agent = true, // ctrl-t
                     21 => self.killToBeginning(), // ctrl-u
                     87, 119 => { // w/W
                         if (self.preview_focus) self.wrap_preview = !self.wrap_preview else self.insertQueryByte(c);
@@ -573,12 +601,16 @@ pub const Tui = struct {
     }
 
     fn cycleAgentFilter(self: *Tui) void {
-        self.agent_filter = if (self.agent_filter) |agent| switch (agent) {
+        self.setAgentFilter(if (self.agent_filter) |agent| switch (agent) {
             .claude => .codex,
             .codex => .pi,
             .pi => .opencode,
             .opencode => null,
-        } else .claude;
+        } else .claude);
+    }
+
+    fn setAgentFilter(self: *Tui, agent: ?scan.Agent) void {
+        self.agent_filter = agent;
         self.recompute();
     }
 
@@ -837,7 +869,7 @@ test "selection changes reset preview and result scroll" {
     try testing.expectEqual(@as(usize, 0), tui.result_scroll);
 }
 
-test "ctrl-t cycles interactive agent filter" {
+test "interactive agent filter picker filters hits" {
     var fav = favorites.Set.init(testing.allocator);
     defer fav.deinit();
     const records = [_]scan.Record{
@@ -850,19 +882,17 @@ test "ctrl-t cycles interactive agent filter" {
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
     try testing.expectEqualStrings("all", tui.agentFilterLabel());
 
-    tui.cycleAgentFilter();
+    tui.setAgentFilter(.claude);
     try testing.expectEqual(scan.Agent.claude, tui.agent_filter.?);
     try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
     try testing.expectEqual(scan.Agent.claude, records[tui.hits.items[0].idx].agent);
 
-    tui.cycleAgentFilter();
-    tui.cycleAgentFilter();
-    tui.cycleAgentFilter();
+    tui.setAgentFilter(.opencode);
     try testing.expectEqual(scan.Agent.opencode, tui.agent_filter.?);
     try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
     try testing.expectEqual(scan.Agent.opencode, records[tui.hits.items[0].idx].agent);
 
-    tui.cycleAgentFilter();
+    tui.setAgentFilter(null);
     try testing.expect(tui.agent_filter == null);
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
 }
