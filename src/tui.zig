@@ -620,14 +620,23 @@ pub const Tui = struct {
     fn writeStatusLine(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record) void {
         const project = if (rec.project.len > 0) std.fs.path.basename(rec.project) else "-";
         const pos = if (self.hits.items.len == 0) 0 else self.sel + 1;
-        b.print(self.a, "\x1b[90m{s}  {d}/{d}  filter:{s}  ({s})  wrap:{s}\x1b[0m\r\n", .{
-            project,
-            pos,
-            self.hits.items.len,
-            self.agentFilterLabel(),
-            rec.agent.label(),
-            if (self.wrap_preview) "on" else "off",
-        }) catch oom();
+        b.print(self.a, "\x1b[90m{s}  {d}/{d}  filter:{s}  ", .{ project, pos, self.hits.items.len, self.agentFilterLabel() }) catch oom();
+        self.writeUsageStatus(b, rec.meta.usage);
+        if (rec.meta.plan.len > 0) b.print(self.a, " ({s})", .{rec.meta.plan}) catch oom();
+        if (rec.meta.usage.rate_percent > 0) b.print(self.a, " {d:.1}%", .{rec.meta.usage.rate_percent}) catch oom();
+        if (rec.meta.usage.context_window > 0) b.print(self.a, "/{d}", .{rec.meta.usage.context_window}) catch oom();
+        b.print(self.a, "  ({s})", .{if (rec.meta.provider.len > 0) rec.meta.provider else rec.agent.label()}) catch oom();
+        if (rec.meta.model.len > 0) b.print(self.a, " {s}", .{rec.meta.model}) catch oom();
+        if (rec.meta.thinking.len > 0) b.print(self.a, " • {s}", .{rec.meta.thinking}) catch oom();
+        b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+    }
+
+    fn writeUsageStatus(self: *Tui, b: *std.ArrayList(u8), u: scan.Usage) void {
+        if (u.input > 0) b.print(self.a, "↑{d} ", .{u.input}) catch oom();
+        if (u.output > 0) b.print(self.a, "↓{d} ", .{u.output}) catch oom();
+        if (u.cache_read > 0) b.print(self.a, "R{d} ", .{u.cache_read}) catch oom();
+        if (u.cache_write > 0) b.print(self.a, "W{d} ", .{u.cache_write}) catch oom();
+        if (u.cost > 0) b.print(self.a, "${d:.3} ", .{u.cost}) catch oom();
     }
 
     fn agentBit(agent: scan.Agent) u4 {

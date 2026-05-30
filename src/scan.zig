@@ -24,12 +24,32 @@ pub const Agent = enum {
     }
 };
 
+pub const Usage = struct {
+    input: u64 = 0,
+    output: u64 = 0,
+    cache_read: u64 = 0,
+    cache_write: u64 = 0,
+    total: u64 = 0,
+    context_window: u64 = 0,
+    rate_percent: f64 = 0,
+    cost: f64 = 0,
+};
+
+pub const Meta = struct {
+    provider: []const u8 = "",
+    model: []const u8 = "",
+    thinking: []const u8 = "",
+    plan: []const u8 = "",
+    usage: Usage = .{},
+};
+
 pub const Record = struct {
     agent: Agent,
     text: []const u8,
     project: []const u8,
     session: []const u8,
     ts: i64, // unix seconds, 0 if unknown
+    meta: Meta = .{},
 };
 
 pub const Scanner = struct {
@@ -147,8 +167,39 @@ pub const Scanner = struct {
 
     fn scanCodex(self: *Scanner) void {
         const p = self.path("/.codex/history.jsonl");
-        const data = self.readAll(p) orelse return;
-        self.parseCodexHistory(data);
+        if (self.readAll(p)) |data| self.parseCodexHistory(data);
+        self.scanCodexSessions();
+    }
+
+    fn scanCodexSessions(self: *Scanner) void {
+        const base = self.path("/.codex/sessions");
+        var root = Io.Dir.cwd().openDir(self.io, base, .{ .iterate = true }) catch return;
+        defer root.close(self.io);
+        var years = root.iterate();
+        while (years.next(self.io) catch null) |ye| {
+            if (ye.kind != .directory) continue;
+            var yd = root.openDir(self.io, ye.name, .{ .iterate = true }) catch continue;
+            defer yd.close(self.io);
+            var months = yd.iterate();
+            while (months.next(self.io) catch null) |me| {
+                if (me.kind != .directory) continue;
+                var md = yd.openDir(self.io, me.name, .{ .iterate = true }) catch continue;
+                defer md.close(self.io);
+                var days = md.iterate();
+                while (days.next(self.io) catch null) |de| {
+                    if (de.kind != .directory) continue;
+                    var dd = md.openDir(self.io, de.name, .{ .iterate = true }) catch continue;
+                    defer dd.close(self.io);
+                    var files = dd.iterate();
+                    while (files.next(self.io) catch null) |fe| {
+                        if (fe.kind != .file or !std.mem.endsWith(u8, fe.name, ".jsonl")) continue;
+                        const full = std.fmt.allocPrint(self.a, "{s}/{s}/{s}/{s}/{s}", .{ base, ye.name, me.name, de.name, fe.name }) catch continue;
+                        const data = self.readAll(full) orelse continue;
+                        self.parseCodexSession(data);
+                    }
+                }
+            }
+        }
     }
 
     /// Parse `~/.codex/history.jsonl` content.
@@ -172,6 +223,72 @@ pub const Scanner = struct {
                 .session = sess,
                 .ts = ts,
             });
+        }
+    }
+
+    pub fn parseCodexSession(self: *Scanner, data: []const u8) void {
+        var cwd: []const u8 = "";
+        var session_id: []const u8 = "";
+        var meta: Meta = .{};
+        const record_start = self.records.items.len;
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            const v = self.parseLine(line) orelse continue;
+            if (v != .object) continue;
+            const o = v.object;
+            const typ = o.get("type") orelse continue;
+            if (typ != .string) continue;
+            if (std.mem.eql(u8, typ.string, "session_meta")) {
+                const payload = o.get("payload") orelse continue;
+                if (payload != .object) continue;
+                if (payload.object.get("cwd")) |x| if (x == .string) {
+                    cwd = x.string;
+                };
+                if (payload.object.get("id")) |x| if (x == .string) {
+                    session_id = x.string;
+                };
+                if (payload.object.get("model_provider")) |x| if (x == .string) {
+                    meta.provider = x.string;
+                };
+                self.applyMetaToSessionRecords(record_start, meta);
+                continue;
+            }
+            if (std.mem.eql(u8, typ.string, "event_msg")) {
+                const payload = o.get("payload") orelse continue;
+                if (payload != .object) continue;
+                const ptype = payload.object.get("type") orelse continue;
+                if (ptype != .string or !std.mem.eql(u8, ptype.string, "token_count")) continue;
+                if (payload.object.get("info")) |info| if (info == .object) {
+                    if (info.object.get("model_context_window")) |x| meta.usage.context_window = intVal(x);
+                    if (info.object.get("total_token_usage")) |u| if (u == .object) {
+                        meta.usage.input = if (u.object.get("input_tokens")) |x| intVal(x) else meta.usage.input;
+                        meta.usage.output = if (u.object.get("output_tokens")) |x| intVal(x) else meta.usage.output;
+                        meta.usage.cache_read = if (u.object.get("cached_input_tokens")) |x| intVal(x) else meta.usage.cache_read;
+                        meta.usage.total = if (u.object.get("total_tokens")) |x| intVal(x) else meta.usage.total;
+                    };
+                };
+                if (payload.object.get("rate_limits")) |rl| if (rl == .object) {
+                    if (rl.object.get("primary")) |primary| if (primary == .object) {
+                        meta.usage.rate_percent = if (primary.object.get("used_percent")) |x| floatVal(x) else meta.usage.rate_percent;
+                    };
+                    if (rl.object.get("plan_type")) |x| if (x == .string) {
+                        meta.plan = x.string;
+                    };
+                };
+                self.applyMetaToSessionRecords(record_start, meta);
+                continue;
+            }
+            if (!std.mem.eql(u8, typ.string, "response_item")) continue;
+            const payload = o.get("payload") orelse continue;
+            if (payload != .object) continue;
+            const ptype = payload.object.get("type") orelse continue;
+            if (ptype != .string or !std.mem.eql(u8, ptype.string, "message")) continue;
+            const role = payload.object.get("role") orelse continue;
+            if (role != .string or !std.mem.eql(u8, role.string, "user")) continue;
+            const content = payload.object.get("content") orelse continue;
+            const text = self.contentText(content) orelse continue;
+            if (text.len == 0 or std.mem.startsWith(u8, text, "<")) continue;
+            self.add(.{ .agent = .codex, .text = text, .project = cwd, .session = session_id, .ts = 0, .meta = meta });
         }
     }
 
@@ -199,10 +316,32 @@ pub const Scanner = struct {
         self.parsePiSession(data);
     }
 
+    fn intVal(v: json.Value) u64 {
+        return switch (v) {
+            .integer => |n| if (n > 0) @intCast(n) else 0,
+            .float => |f| if (f > 0) @intFromFloat(f) else 0,
+            else => 0,
+        };
+    }
+
+    fn floatVal(v: json.Value) f64 {
+        return switch (v) {
+            .integer => |n| @floatFromInt(n),
+            .float => |f| f,
+            else => 0,
+        };
+    }
+
+    fn applyMetaToSessionRecords(self: *Scanner, start: usize, meta: Meta) void {
+        for (self.records.items[start..]) |*rec| rec.meta = meta;
+    }
+
     /// Parse a single pi session `.jsonl` file content.
     pub fn parsePiSession(self: *Scanner, data: []const u8) void {
         var cwd: []const u8 = "";
         var session_id: []const u8 = "";
+        var meta: Meta = .{};
+        const record_start = self.records.items.len;
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
             // Only session headers and user messages yield records. Skip the
@@ -212,7 +351,10 @@ pub const Scanner = struct {
             // head — otherwise we'd scan multi-KB assistant bodies in full.
             const head = line[0..@min(line.len, 128)];
             const keep = std.mem.startsWith(u8, line, "{\"type\":\"session\"") or
-                std.mem.indexOf(u8, head, "\"role\":\"user\"") != null;
+                std.mem.startsWith(u8, line, "{\"type\":\"model_change\"") or
+                std.mem.startsWith(u8, line, "{\"type\":\"thinking_level_change\"") or
+                std.mem.indexOf(u8, head, "\"role\":\"user\"") != null or
+                std.mem.indexOf(u8, head, "\"role\":\"assistant\"") != null;
             if (!keep) continue;
             const v = self.parseLine(line) orelse continue;
             if (v != .object) continue;
@@ -228,11 +370,49 @@ pub const Scanner = struct {
                 };
                 continue;
             }
+            if (std.mem.eql(u8, typ.string, "model_change")) {
+                if (o.get("provider")) |x| if (x == .string) {
+                    meta.provider = x.string;
+                };
+                if (o.get("modelId")) |x| if (x == .string) {
+                    meta.model = x.string;
+                };
+                self.applyMetaToSessionRecords(record_start, meta);
+                continue;
+            }
+            if (std.mem.eql(u8, typ.string, "thinking_level_change")) {
+                if (o.get("thinkingLevel")) |x| if (x == .string) {
+                    meta.thinking = x.string;
+                };
+                self.applyMetaToSessionRecords(record_start, meta);
+                continue;
+            }
             if (!std.mem.eql(u8, typ.string, "message")) continue;
             const msg = o.get("message") orelse continue;
             if (msg != .object) continue;
             const role = msg.object.get("role") orelse continue;
-            if (role != .string or !std.mem.eql(u8, role.string, "user")) continue;
+            if (role != .string) continue;
+            if (std.mem.eql(u8, role.string, "assistant")) {
+                if (msg.object.get("provider")) |x| if (x == .string) {
+                    meta.provider = x.string;
+                };
+                if (msg.object.get("model")) |x| if (x == .string) {
+                    meta.model = x.string;
+                };
+                if (msg.object.get("usage")) |u| if (u == .object) {
+                    meta.usage.input += if (u.object.get("input")) |x| intVal(x) else 0;
+                    meta.usage.output += if (u.object.get("output")) |x| intVal(x) else 0;
+                    meta.usage.cache_read += if (u.object.get("cacheRead")) |x| intVal(x) else 0;
+                    meta.usage.cache_write += if (u.object.get("cacheWrite")) |x| intVal(x) else 0;
+                    meta.usage.total += if (u.object.get("totalTokens")) |x| intVal(x) else 0;
+                    if (u.object.get("cost")) |cost| if (cost == .object) {
+                        meta.usage.cost += if (cost.object.get("total")) |x| floatVal(x) else 0;
+                    };
+                };
+                self.applyMetaToSessionRecords(record_start, meta);
+                continue;
+            }
+            if (!std.mem.eql(u8, role.string, "user")) continue;
             const content = msg.object.get("content") orelse continue;
             const text = self.contentText(content) orelse continue;
             if (text.len == 0) continue;
@@ -242,6 +422,7 @@ pub const Scanner = struct {
                 .project = cwd,
                 .session = session_id,
                 .ts = 0,
+                .meta = meta,
             });
         }
     }
@@ -251,6 +432,8 @@ pub const Scanner = struct {
         "'role',json_extract(m.data,'$.role')," ++
         "'type',json_extract(p.data,'$.type')," ++
         "'text',json_extract(p.data,'$.text')," ++
+        "'provider',json_extract(m.data,'$.model.providerID')," ++
+        "'model',json_extract(m.data,'$.model.modelID')," ++
         "'project',s.directory," ++
         "'session',s.id) " ++
         "FROM part p " ++
@@ -298,12 +481,15 @@ pub const Scanner = struct {
             if (txt != .string or txt.string.len == 0) continue;
             const proj = if (o.get("project")) |x| (if (x == .string) x.string else "") else "";
             const sess = if (o.get("session")) |x| (if (x == .string) x.string else "") else "";
+            const provider = if (o.get("provider")) |x| (if (x == .string) x.string else "") else "";
+            const model = if (o.get("model")) |x| (if (x == .string) x.string else "") else "";
             self.add(.{
                 .agent = .opencode,
                 .text = txt.string,
                 .project = proj,
                 .session = sess,
                 .ts = 0,
+                .meta = .{ .provider = provider, .model = model },
             });
         }
     }
