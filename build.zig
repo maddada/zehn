@@ -4,10 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const default_git_rev = std.mem.trim(u8, b.run(&.{ "sh", "-c", "git rev-parse HEAD 2>/dev/null || echo unknown" }), " \r\n");
+    const default_version = std.mem.trim(u8, b.run(&.{ "sh", "-c", "git describe --tags --match 'v*' --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.0.0" }), " \r\n");
     const git_rev = b.option([]const u8, "git-rev", "git commit embedded in the binary") orelse default_git_rev;
+    const version = b.option([]const u8, "version", "version embedded in the binary") orelse default_version;
 
     const options = b.addOptions();
     options.addOption([]const u8, "git_rev", git_rev);
+    options.addOption([]const u8, "version", version);
 
     const exe = b.addExecutable(.{
         .name = "zehn",

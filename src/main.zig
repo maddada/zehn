@@ -6,7 +6,7 @@ const favorites = @import("favorites.zig");
 const fork = @import("fork.zig");
 const build_options = @import("build_options");
 
-const version = "0.2.1";
+const version = build_options.version;
 const git_rev = build_options.git_rev;
 
 pub fn main(init: std.process.Init) !void {

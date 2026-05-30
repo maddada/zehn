@@ -37,7 +37,7 @@ jobs:
           fi
 
       - name: Build
-        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dgit-rev=${GITHUB_SHA}
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dgit-rev=${GITHUB_SHA} -Dversion=${{ steps.vars.outputs.version }}
 
       - name: Package tarball
         run: |
@@ -87,7 +87,7 @@ jobs:
           set -euo pipefail
           version="${{ steps.vars.outputs.version }}"
           for target in x86_64-macos aarch64-macos; do
-            zig build -Doptimize=ReleaseFast -Dtarget="$target" -Dgit-rev=${GITHUB_SHA}
+            zig build -Doptimize=ReleaseFast -Dtarget="$target" -Dgit-rev=${GITHUB_SHA} -Dversion="$version"
             stage="zehn-${version}-${target}"
             mkdir -p "$stage"
             cp zig-out/bin/zehn "$stage/"
@@ -104,10 +104,10 @@ jobs:
           dmgroot="dmg-staging/zehn-${version}"
           mkdir -p "$dmgroot"
           # arm64 binary
-          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos -Dgit-rev=${GITHUB_SHA}
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos -Dgit-rev=${GITHUB_SHA} -Dversion="$version"
           cp zig-out/bin/zehn "$dmgroot/zehn-aarch64"
           # x86_64 binary
-          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos -Dgit-rev=${GITHUB_SHA}
+          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos -Dgit-rev=${GITHUB_SHA} -Dversion="$version"
           cp zig-out/bin/zehn "$dmgroot/zehn-x86_64"
           [ -f README.md ] && cp README.md "$dmgroot/" || true
           [ -f LICENSE ] && cp LICENSE "$dmgroot/" || true
