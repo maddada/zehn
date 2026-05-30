@@ -2,6 +2,8 @@ name: Release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - "v*"
 
@@ -27,7 +29,12 @@ jobs:
 
       - name: Determine version
         id: vars
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=nightly" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
@@ -68,7 +75,12 @@ jobs:
 
       - name: Determine version
         id: vars
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=nightly" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build macOS targets and package tarballs
         run: |
@@ -118,6 +130,16 @@ jobs:
     needs: [linux, macos]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Move nightly tag
+        if: github.ref_type == 'branch'
+        run: |
+          git tag -f nightly "$GITHUB_SHA"
+          git push -f origin nightly
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -134,6 +156,10 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.ref_type == 'branch' && 'nightly' || github.ref_name }}
+          name: ${{ github.ref_type == 'branch' && 'Nightly' || github.ref_name }}
+          prerelease: ${{ github.ref_type == 'branch' }}
+          make_latest: ${{ github.ref_type == 'branch' && 'false' || 'true' }}
           generate_release_notes: true
           files: |
             dist/zehn-*.tar.gz

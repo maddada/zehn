@@ -29,6 +29,9 @@ pub fn main(init: std.process.Init) !void {
             try w.print("zehn {s}\n", .{version});
             try w.flush();
             return;
+        } else if (std.mem.eql(u8, arg, "update")) {
+            try selfUpdate(init, w);
+            return;
         } else if (std.mem.eql(u8, arg, "--list")) {
             try listMode(a, io, home, w);
             return;
@@ -48,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
                 \\  zehn            find a prompt, then RESUME that session in its agent
                 \\  zehn --print    just print the selected prompt text (no resume)
                 \\  zehn --project  print agent<TAB>project<TAB>text (implies --print)
+                \\  zehn update     update zehn from the latest master build
                 \\  zehn --list     dump all records
                 \\
                 \\Resume:  claude --resume <id> | codex resume <id>
@@ -105,6 +109,26 @@ pub fn main(init: std.process.Init) !void {
             .copy => try copyPrompt(io, w, rec),
             .fork => try forkSession(init, io, w, rec, action.fork_agent),
         }
+    }
+}
+
+/// Re-run the official installer. It builds from the latest master and replaces
+/// the binary under $PREFIX/bin (default: ~/.local/bin), matching the install path.
+fn selfUpdate(init: std.process.Init, w: *Io.Writer) !void {
+    try w.writeAll("zehn: updating from https://github.com/al3rez/zehn ...\n");
+    try w.flush();
+    var child = std.process.spawn(init.io, .{
+        .argv = &.{ "sh", "-c", "curl -fsSL https://raw.githubusercontent.com/al3rez/zehn/master/scripts/install.sh | sh" },
+        .environ_map = init.environ_map,
+    }) catch |err| {
+        try w.print("zehn: failed to start updater ({t})\n", .{err});
+        try w.flush();
+        return;
+    };
+    const term = try child.wait(init.io);
+    if (term != .exited or term.exited != 0) {
+        try w.writeAll("zehn: update failed\n");
+        try w.flush();
     }
 }
 
