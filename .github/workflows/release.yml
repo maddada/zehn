@@ -157,9 +157,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_type == 'branch' && 'nightly' || github.ref_name }}
-          name: ${{ github.ref_type == 'branch' && 'Nightly' || github.ref_name }}
-          prerelease: ${{ github.ref_type == 'branch' }}
-          make_latest: ${{ github.ref_type == 'branch' && 'false' || 'true' }}
+          name: ${{ github.ref_type == 'branch' && 'Latest master' || github.ref_name }}
+          prerelease: false
+          make_latest: true
           generate_release_notes: true
           files: |
             dist/zehn-*.tar.gz
