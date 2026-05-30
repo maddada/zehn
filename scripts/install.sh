@@ -165,7 +165,12 @@ git -C "$tmp/zehn" fetch --depth 1 origin 'refs/tags/v*:refs/tags/v*' >/dev/null
 
 info "Building (ReleaseFast) ..."
 rev="$(git -C "$tmp/zehn" rev-parse HEAD 2>/dev/null || echo unknown)"
-ver="$(git -C "$tmp/zehn" describe --tags --match 'v*' --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.0.0)"
+# Pick the highest v* tag by version, not by ancestry: the shallow `--depth 1`
+# clone has no history, so `git describe` can't see a tag unless HEAD is exactly
+# it — which is why building master's tip reported 0.0.0. The fetch above already
+# created the local tag refs, so a version sort is reachability-free.
+ver="$(git -C "$tmp/zehn" tag -l 'v*' --sort=-v:refname | head -n1 | sed 's/^v//')"
+[ -n "$ver" ] || ver=0.0.0
 zig build -Doptimize=ReleaseFast -Dgit-rev="$rev" -Dversion="$ver" --prefix "$PREFIX" --build-file "$tmp/zehn/build.zig"
 
 new_ver="$("$bin" --version 2>/dev/null | awk '{print $2}')"
