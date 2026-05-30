@@ -871,7 +871,9 @@ pub const Tui = struct {
         // Budget for: blank, search line, blank, optional scroll info, blank, hint.
         const rows_avail = if (max_rows > 6) max_rows - 6 else 1;
         const visible = @min(rows_avail, count);
-        const start = if (count <= visible) 0 else @min(self.project_sel, count - visible);
+        // Same windowing strategy as pi's selectors: keep the highlighted row
+        // near the middle, only pinning at the start/end of the list.
+        const start = if (count <= visible) 0 else @min(self.project_sel -| (visible / 2), count - visible);
         var shown: usize = 0;
         while (shown < visible) : (shown += 1) {
             const idx = start + shown;
