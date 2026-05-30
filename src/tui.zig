@@ -100,6 +100,10 @@ pub const Tui = struct {
     sel: usize = 0,
     top: usize = 0,
     preview_scroll: usize = 0,
+    result_scroll: usize = 0,
+    preview_focus: bool = false,
+    wrap_preview: bool = true,
+    fullscreen_preview: bool = false,
     rows: u16 = 24,
     cols: u16 = 80,
     orig: posix.termios = undefined,
@@ -180,11 +184,13 @@ pub const Tui = struct {
         self.sel = 0;
         self.top = 0;
         self.preview_scroll = 0;
+        self.result_scroll = 0;
     }
 
     fn listHeight(self: *Tui) usize {
-        // 1 prompt line + 1 separator + preview(5)
-        const reserved: usize = 1 + 1 + 5;
+        // 1 prompt line + 1 separator + preview area.
+        const preview_rows: usize = if (self.fullscreen_preview) self.rows -| 2 else 5;
+        const reserved: usize = 1 + 1 + preview_rows;
         if (self.rows <= reserved + 1) return 1;
         return self.rows - reserved;
     }
@@ -200,8 +206,11 @@ pub const Tui = struct {
     // offsets (matches are byte-wise); a codepoint is highlighted if its first
     // byte is a match position.
     fn writeHighlighted(self: *Tui, buf: *std.ArrayList(u8), text: []const u8, m: fuzzy.Match, max: usize, selected: bool) void {
+        const scroll = if (selected) self.result_scroll else 0;
         var pi: usize = 0;
-        var i: usize = 0;
+        var i: usize = @min(scroll, text.len);
+        while (i < text.len and (text[i] & 0xC0) == 0x80) i += 1;
+        if (i > 0) buf.appendSlice(self.a, "…") catch oom();
         var used: usize = 0;
         while (i < text.len) {
             const d = uni.decode(text[i..]);
@@ -305,7 +314,9 @@ pub const Tui = struct {
             var pv: [256]u8 = undefined;
             const head = std.fmt.bufPrint(&pv, "\x1b[90magent:\x1b[0m {s}  \x1b[90mproject:\x1b[0m {s}\r\n", .{ rec.agent.label(), if (rec.project.len > 0) rec.project else "-" }) catch "";
             b.appendSlice(self.a, head) catch oom();
-            // up to 4 lines, wrapped at display width, UTF-8 aware
+            const preview_lines: usize = if (self.fullscreen_preview) self.rows -| 3 else 4;
+            if (self.preview_focus) b.appendSlice(self.a, "\x1b[1;36mpreview\x1b[0m\r\n") catch oom();
+            // preview lines, wrapped at display width when enabled, UTF-8 aware
             var i: usize = 0;
             var skipped: usize = 0;
             while (i < rec.text.len and skipped < self.preview_scroll) : (skipped += 1) {
@@ -313,7 +324,7 @@ pub const Tui = struct {
                 if (i < rec.text.len and rec.text[i] == '\n') i += 1;
             }
             var line_lines: usize = 0;
-            while (i < rec.text.len and line_lines < 4) {
+            while (i < rec.text.len and line_lines < preview_lines) {
                 var used: usize = 0;
                 const line_start = i;
                 while (i < rec.text.len) {
@@ -321,7 +332,13 @@ pub const Tui = struct {
                     const d = uni.decode(rec.text[i..]);
                     const is_ctrl = d.cp < 0x20 or (d.cp >= 0x7f and d.cp < 0xa0);
                     const cw: usize = if (is_ctrl) 1 else uni.charWidth(d.cp);
-                    if (used + cw > self.cols) break;
+                    if (used + cw > self.cols) {
+                        if (!self.wrap_preview) break;
+                        b.appendSlice(self.a, "\r\n") catch oom();
+                        line_lines += 1;
+                        used = 0;
+                        if (line_lines >= preview_lines) break;
+                    }
                     if (is_ctrl) b.append(self.a, ' ') catch oom() else b.appendSlice(self.a, rec.text[i .. i + d.len]) catch oom();
                     used += cw;
                     i += d.len;
@@ -398,16 +415,25 @@ pub const Tui = struct {
                             return .{ .idx = self.hits.items[self.sel].idx, .kind = .resume_session };
                         return null;
                     },
-                    6 => self.toggleFavorite(), // ctrl-f
+                    6 => { // ctrl-f
+                        if (self.preview_focus) self.fullscreen_preview = !self.fullscreen_preview else self.toggleFavorite();
+                    },
                     25 => { // ctrl-y: copy selected to clipboard
                         if (self.sel < self.hits.items.len)
                             return .{ .idx = self.hits.items[self.sel].idx, .kind = .copy };
                     },
+                    9 => self.preview_focus = !self.preview_focus, // tab
                     15 => { // ctrl-o: fork into another agent
                         if (self.sel < self.hits.items.len) self.forking = true;
                     },
                     11 => self.killToEnd(), // ctrl-k
                     21 => self.killToBeginning(), // ctrl-u
+                    87, 119 => { // w/W
+                        if (self.preview_focus) self.wrap_preview = !self.wrap_preview else self.insertQueryByte(c);
+                    },
+                    70, 102 => { // f/F
+                        if (self.preview_focus) self.fullscreen_preview = !self.fullscreen_preview else self.insertQueryByte(c);
+                    },
                     127, 8 => self.backspace(),
                     14 => self.moveDown(), // ctrl-n
                     16 => self.moveUp(), // ctrl-p
@@ -415,9 +441,7 @@ pub const Tui = struct {
                         // accept printable ASCII and any UTF-8 continuation/lead
                         // bytes (>=128), but not DEL
                         if ((c >= 32 and c < 127) or c >= 128) {
-                            self.query.insert(self.a, self.query_cursor, c) catch oom();
-                            self.query_cursor += 1;
-                            self.recompute();
+                            self.insertQueryByte(c);
                         }
                     },
                 }
@@ -469,8 +493,12 @@ pub const Tui = struct {
         }
         if (bytes.len >= 6 and bytes[2] == '1' and bytes[3] == ';' and bytes[4] == '5') {
             switch (bytes[5]) {
-                'C' => self.moveWordRight(), // ctrl-right
-                'D' => self.moveWordLeft(), // ctrl-left
+                'C' => { // ctrl-right
+                    if (self.preview_focus) self.scrollResultToEnd() else self.moveWordRight();
+                },
+                'D' => { // ctrl-left
+                    if (self.preview_focus) self.result_scroll = 0 else self.moveWordLeft();
+                },
                 else => {},
             }
             return 6;
@@ -478,8 +506,8 @@ pub const Tui = struct {
         switch (bytes[2]) {
             'A' => self.moveUp(),
             'B' => self.moveDown(),
-            'C' => self.moveRight(),
-            'D' => self.moveLeft(),
+            'C' => if (self.preview_focus) self.scrollResult(8) else self.moveRight(),
+            'D' => if (self.preview_focus) self.scrollResult(-8) else self.moveLeft(),
             else => {},
         }
         return 3;
@@ -526,6 +554,12 @@ pub const Tui = struct {
     fn nextChar(q: []const u8, pos: usize) usize {
         if (pos >= q.len) return q.len;
         return pos + uni.decode(q[pos..]).len;
+    }
+
+    fn insertQueryByte(self: *Tui, c: u8) void {
+        self.query.insert(self.a, self.query_cursor, c) catch oom();
+        self.query_cursor += 1;
+        self.recompute();
     }
 
     fn deleteRange(self: *Tui, start: usize, end: usize) void {
@@ -585,6 +619,21 @@ pub const Tui = struct {
         const end = self.query_cursor;
         self.moveWordLeft();
         self.deleteRange(self.query_cursor, end);
+    }
+
+    fn scrollResult(self: *Tui, delta: isize) void {
+        if (delta < 0) {
+            const d: usize = @intCast(-delta);
+            self.result_scroll = if (d > self.result_scroll) 0 else self.result_scroll - d;
+        } else {
+            self.result_scroll += @intCast(delta);
+        }
+    }
+
+    fn scrollResultToEnd(self: *Tui) void {
+        if (self.sel < self.hits.items.len) {
+            self.result_scroll = self.records[self.hits.items[self.sel].idx].text.len;
+        }
     }
 
     fn scrollPreview(self: *Tui, delta: isize) void {
@@ -685,4 +734,27 @@ test "page up and down escape sequences scroll preview without typing tilde" {
     try testing.expectEqual(@as(?usize, 4), tui.handleEscapeSequence("\x1b[5~"));
     try testing.expectEqual(@as(usize, 0), tui.preview_scroll);
     try testing.expectEqualStrings("", tui.query.items);
+}
+
+test "focused preview uses arrows for result horizontal scroll" {
+    var tui = testTui();
+    defer tui.query.deinit(testing.allocator);
+    tui.preview_focus = true;
+
+    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[C"));
+    try testing.expectEqual(@as(usize, 8), tui.result_scroll);
+    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[D"));
+    try testing.expectEqual(@as(usize, 0), tui.result_scroll);
+}
+
+test "horizontal result scroll exposes tail of skill-heavy prompts" {
+    var tui = testTui();
+    tui.result_scroll = 23;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    tui.writeHighlighted(&out, "/skill lots of boilerplate MY PROMPT", .{ .score = 0 }, 40, true);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "MY PROMPT") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "/skill lots") == null);
 }
