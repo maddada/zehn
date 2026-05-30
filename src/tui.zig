@@ -199,12 +199,25 @@ pub const Tui = struct {
         self.result_scroll = 0;
     }
 
+    fn bottomPaneHeight(self: *const Tui) usize {
+        if (self.filtering_agent or self.filtering_project) {
+            // Pi-style selectors keep up to ~10 visible items plus search/hints.
+            // Give the picker more room and shrink the results list instead of
+            // overflowing the terminal when the window is short.
+            return @min(@as(usize, 13), self.rows -| 3);
+        }
+        return if (self.fullscreen_preview) self.rows -| 2 else 5;
+    }
+
     fn listHeight(self: *Tui) usize {
-        // 1 prompt line + 1 separator + preview area.
-        const preview_rows: usize = if (self.fullscreen_preview) self.rows -| 2 else 5;
-        const reserved: usize = 1 + 1 + preview_rows;
+        // 1 prompt line + 1 separator + bottom pane.
+        const reserved: usize = 1 + 1 + self.bottomPaneHeight();
         if (self.rows <= reserved + 1) return 1;
         return self.rows - reserved;
+    }
+
+    fn bottomRowsAfterList(self: *const Tui, list_height: usize) usize {
+        return self.rows -| (1 + list_height + 1);
     }
 
     fn clampScroll(self: *Tui) void {
@@ -320,7 +333,7 @@ pub const Tui = struct {
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
 
         if (self.filtering_project) {
-            self.writeProjectFilterPicker(b, 5);
+            self.writeProjectFilterPicker(b, self.bottomRowsAfterList(h));
             try w.writeAll(b.items);
             try w.flush();
             return;
@@ -328,7 +341,7 @@ pub const Tui = struct {
 
         // agent filter mode replaces the preview with a small picker
         if (self.filtering_agent) {
-            self.writeAgentFilterPicker(b, 5);
+            self.writeAgentFilterPicker(b, self.bottomRowsAfterList(h));
             try w.writeAll(b.items);
             try w.flush();
             return;
