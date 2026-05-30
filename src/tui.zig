@@ -335,7 +335,6 @@ pub const Tui = struct {
             b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
         }
 
-        // separator
         b.appendSlice(self.a, "\x1b[90m") catch oom();
         var k: usize = 0;
         const sep_cols = @max(@as(usize, 1), @as(usize, self.cols) -| 1);
@@ -364,7 +363,6 @@ pub const Tui = struct {
             return;
         }
 
-        // preview of selected
         if (self.sel < self.hits.items.len) {
             const rec = self.records[self.hits.items[self.sel].idx];
             const bottom_rows = self.bottomRowsAfterList(h);
@@ -411,7 +409,6 @@ pub const Tui = struct {
                 // the top of the alt screen.
                 if (filled) break;
                 b.appendSlice(self.a, "\r\n") catch oom();
-                // if we stopped on a newline, skip it
                 if (i < rec.text.len and rec.text[i] == '\n') i += 1;
                 line_lines += 1;
                 if (i == line_start and used == 0) i += 1; // guarantee progress
