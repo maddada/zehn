@@ -161,6 +161,7 @@ fi
 
 info "Cloning $REPO ..."
 git clone --depth 1 "$REPO" "$tmp/zehn"
+git -C "$tmp/zehn" fetch --depth 1 origin 'refs/tags/v*:refs/tags/v*' >/dev/null 2>&1 || true
 
 info "Building (ReleaseFast) ..."
 rev="$(git -C "$tmp/zehn" rev-parse HEAD 2>/dev/null || echo unknown)"
