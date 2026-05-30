@@ -95,6 +95,7 @@ pub const Tui = struct {
     io: Io,
     records: []const scan.Record,
     query: std.ArrayList(u8) = .empty,
+    query_cursor: usize = 0,
     hits: std.ArrayList(Hit) = .empty,
     sel: usize = 0,
     top: usize = 0,
@@ -241,7 +242,7 @@ pub const Tui = struct {
 
         // prompt line
         b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch oom();
-        b.appendSlice(self.a, self.query.items) catch oom();
+        self.writeQueryWithCursor(b);
         var cnt: [128]u8 = undefined;
         const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len }) catch "\r\n";
         b.appendSlice(self.a, cs) catch oom();
@@ -377,11 +378,37 @@ pub const Tui = struct {
                 }
 
                 if (c == 27) {
-                    // escape sequence (arrows) or bare ESC
+                    // escape sequence (arrows and readline-style modified keys) or bare ESC
                     if (i + 2 < n and ibuf[i + 1] == '[') {
+                        if (ibuf[i + 2] == '3' and i + 5 < n and ibuf[i + 3] == ';' and ibuf[i + 4] == '5' and ibuf[i + 5] == '~') {
+                            self.deleteWordForward(); // ctrl-delete
+                            i += 6;
+                            continue;
+                        }
+                        if (i + 7 < n and ibuf[i + 2] == '1' and ibuf[i + 3] == '2' and ibuf[i + 4] == '7' and ibuf[i + 5] == ';' and ibuf[i + 6] == '5' and ibuf[i + 7] == 'u') {
+                            self.deleteWordBackward(); // ctrl-backspace (CSI u)
+                            i += 8;
+                            continue;
+                        }
+                        if (i + 5 < n and ibuf[i + 2] == '8' and ibuf[i + 3] == ';' and ibuf[i + 4] == '5' and ibuf[i + 5] == 'u') {
+                            self.deleteWordBackward(); // ctrl-backspace (CSI u)
+                            i += 6;
+                            continue;
+                        }
+                        if (i + 5 < n and ibuf[i + 2] == '1' and ibuf[i + 3] == ';' and ibuf[i + 4] == '5') {
+                            switch (ibuf[i + 5]) {
+                                'C' => self.moveWordRight(), // ctrl-right
+                                'D' => self.moveWordLeft(), // ctrl-left
+                                else => {},
+                            }
+                            i += 6;
+                            continue;
+                        }
                         switch (ibuf[i + 2]) {
                             'A' => self.moveUp(),
                             'B' => self.moveDown(),
+                            'C' => self.moveRight(),
+                            'D' => self.moveLeft(),
                             else => {},
                         }
                         i += 3;
@@ -404,25 +431,17 @@ pub const Tui = struct {
                     15 => { // ctrl-o: fork into another agent
                         if (self.sel < self.hits.items.len) self.forking = true;
                     },
-                    127, 8 => {
-                        if (self.query.items.len > 0) {
-                            // pop a full UTF-8 codepoint
-                            _ = self.query.pop();
-                            while (self.query.items.len > 0 and
-                                (self.query.items[self.query.items.len - 1] & 0xC0) == 0x80)
-                            {
-                                _ = self.query.pop();
-                            }
-                            self.recompute();
-                        }
-                    },
+                    11 => self.killToEnd(), // ctrl-k
+                    21 => self.killToBeginning(), // ctrl-u
+                    127, 8 => self.backspace(),
                     14 => self.moveDown(), // ctrl-n
                     16 => self.moveUp(), // ctrl-p
                     else => {
                         // accept printable ASCII and any UTF-8 continuation/lead
                         // bytes (>=128), but not DEL
                         if ((c >= 32 and c < 127) or c >= 128) {
-                            self.query.append(self.a, c) catch oom();
+                            self.query.insert(self.a, self.query_cursor, c) catch oom();
+                            self.query_cursor += 1;
                             self.recompute();
                         }
                     },
@@ -451,6 +470,108 @@ pub const Tui = struct {
         }
     }
 
+    fn writeQueryWithCursor(self: *Tui, b: *std.ArrayList(u8)) void {
+        const q = self.query.items;
+        const max: usize = if (self.cols > 44) self.cols - 44 else 20;
+        var start: usize = 0;
+        if (self.query_cursor > max / 2) start = self.query_cursor - max / 2;
+        while (start < q.len and (q[start] & 0xC0) == 0x80) start += 1;
+        var end: usize = @min(q.len, start + max);
+        while (end < q.len and (q[end] & 0xC0) == 0x80) end -= 1;
+        if (self.query_cursor >= end and end < q.len) {
+            end = nextChar(q, self.query_cursor);
+            start = if (end > max) end - max else 0;
+            while (start < q.len and (q[start] & 0xC0) == 0x80) start += 1;
+        }
+
+        if (start > 0) b.appendSlice(self.a, "…") catch oom();
+        b.appendSlice(self.a, q[start..self.query_cursor]) catch oom();
+        b.appendSlice(self.a, "\x1b[7m") catch oom();
+        if (self.query_cursor < q.len) {
+            const d = uni.decode(q[self.query_cursor..]);
+            b.appendSlice(self.a, q[self.query_cursor .. self.query_cursor + d.len]) catch oom();
+        } else {
+            b.append(self.a, ' ') catch oom();
+        }
+        b.appendSlice(self.a, "\x1b[0m") catch oom();
+        if (self.query_cursor < q.len) {
+            const d = uni.decode(q[self.query_cursor..]);
+            b.appendSlice(self.a, q[self.query_cursor + d.len .. end]) catch oom();
+        }
+        if (end < q.len) b.appendSlice(self.a, "…") catch oom();
+    }
+
+    fn prevChar(q: []const u8, pos: usize) usize {
+        if (pos == 0) return 0;
+        var p = pos - 1;
+        while (p > 0 and (q[p] & 0xC0) == 0x80) p -= 1;
+        return p;
+    }
+
+    fn nextChar(q: []const u8, pos: usize) usize {
+        if (pos >= q.len) return q.len;
+        return pos + uni.decode(q[pos..]).len;
+    }
+
+    fn deleteRange(self: *Tui, start: usize, end: usize) void {
+        if (end <= start) return;
+        std.mem.copyForwards(u8, self.query.items[start..], self.query.items[end..]);
+        self.query.shrinkRetainingCapacity(self.query.items.len - (end - start));
+        self.query_cursor = start;
+        self.recompute();
+    }
+
+    fn backspace(self: *Tui) void {
+        if (self.query_cursor == 0) return;
+        self.deleteRange(prevChar(self.query.items, self.query_cursor), self.query_cursor);
+    }
+
+    fn killToEnd(self: *Tui) void {
+        self.deleteRange(self.query_cursor, self.query.items.len);
+    }
+
+    fn killToBeginning(self: *Tui) void {
+        self.deleteRange(0, self.query_cursor);
+    }
+
+    fn moveLeft(self: *Tui) void {
+        self.query_cursor = prevChar(self.query.items, self.query_cursor);
+    }
+
+    fn moveRight(self: *Tui) void {
+        self.query_cursor = nextChar(self.query.items, self.query_cursor);
+    }
+
+    fn isWordByte(c: u8) bool {
+        return std.ascii.isAlphanumeric(c) or c == '_';
+    }
+
+    fn moveWordLeft(self: *Tui) void {
+        var p = self.query_cursor;
+        while (p > 0 and !isWordByte(self.query.items[prevChar(self.query.items, p)])) p = prevChar(self.query.items, p);
+        while (p > 0 and isWordByte(self.query.items[prevChar(self.query.items, p)])) p = prevChar(self.query.items, p);
+        self.query_cursor = p;
+    }
+
+    fn moveWordRight(self: *Tui) void {
+        var p = self.query_cursor;
+        while (p < self.query.items.len and !isWordByte(self.query.items[p])) p = nextChar(self.query.items, p);
+        while (p < self.query.items.len and isWordByte(self.query.items[p])) p = nextChar(self.query.items, p);
+        self.query_cursor = p;
+    }
+
+    fn deleteWordForward(self: *Tui) void {
+        const start = self.query_cursor;
+        self.moveWordRight();
+        self.deleteRange(start, self.query_cursor);
+    }
+
+    fn deleteWordBackward(self: *Tui) void {
+        const end = self.query_cursor;
+        self.moveWordLeft();
+        self.deleteRange(self.query_cursor, end);
+    }
+
     fn moveDown(self: *Tui) void {
         if (self.hits.items.len == 0) return;
         if (self.sel + 1 < self.hits.items.len) self.sel += 1;
@@ -459,3 +580,66 @@ pub const Tui = struct {
         if (self.sel > 0) self.sel -= 1;
     }
 };
+
+const testing = std.testing;
+
+fn testTui() Tui {
+    return Tui.init(testing.allocator, undefined, &.{}, undefined, "");
+}
+
+test "query render keeps typed search text visible with cursor" {
+    var tui = testTui();
+    defer tui.query.deinit(testing.allocator);
+    tui.cols = 24;
+    try tui.query.appendSlice(testing.allocator, "abcdef");
+    tui.query_cursor = tui.query.items.len;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    tui.writeQueryWithCursor(&out);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "abcdef") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[7m \x1b[0m") != null);
+}
+
+test "query supports readline-style character and line editing" {
+    var tui = testTui();
+    defer tui.query.deinit(testing.allocator);
+    try tui.query.appendSlice(testing.allocator, "hello world");
+    tui.query_cursor = tui.query.items.len;
+
+    tui.moveLeft();
+    tui.moveLeft();
+    try testing.expectEqual(@as(usize, 9), tui.query_cursor);
+    try tui.query.insert(testing.allocator, tui.query_cursor, '!');
+    tui.query_cursor += 1;
+    try testing.expectEqualStrings("hello wor!ld", tui.query.items);
+
+    tui.backspace();
+    try testing.expectEqualStrings("hello world", tui.query.items);
+    try testing.expectEqual(@as(usize, 9), tui.query_cursor);
+
+    tui.killToBeginning();
+    try testing.expectEqualStrings("ld", tui.query.items);
+    try testing.expectEqual(@as(usize, 0), tui.query_cursor);
+
+    tui.killToEnd();
+    try testing.expectEqualStrings("", tui.query.items);
+}
+
+test "query supports word movement and word deletion" {
+    var tui = testTui();
+    defer tui.query.deinit(testing.allocator);
+    try tui.query.appendSlice(testing.allocator, "one two_three four");
+    tui.query_cursor = 0;
+
+    tui.moveWordRight();
+    try testing.expectEqual(@as(usize, 3), tui.query_cursor);
+    tui.deleteWordForward();
+    try testing.expectEqualStrings("one four", tui.query.items);
+    try testing.expectEqual(@as(usize, 3), tui.query_cursor);
+
+    tui.query_cursor = tui.query.items.len;
+    tui.deleteWordBackward();
+    try testing.expectEqualStrings("one ", tui.query.items);
+}
