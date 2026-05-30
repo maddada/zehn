@@ -43,7 +43,15 @@ One line, macOS or Linux:
 bash <(curl -L https://al3rez.com/zehn)
 ```
 
-It clones the repo, does a `ReleaseFast` build, and leaves the binary at `~/.local/bin/zehn`. If you don't already have [Zig 0.16+](https://ziglang.org/download/), it grabs it for you — via `brew`/`pacman` when present, otherwise the official tarball from ziglang.org. Set `PREFIX` to install somewhere else (`PREFIX=/usr/local bash <(curl -L ...)`), or `NO_INSTALL_ZIG=1` to make it refuse rather than fetch Zig.
+It clones the repo, does a `ReleaseFast` build, and leaves the binary at `~/.local/bin/zehn`. If you don't already have [Zig 0.16+](https://ziglang.org/download/), it grabs it for you via `brew`/`pacman` when present, otherwise the official tarball from ziglang.org. Set `PREFIX` to install somewhere else (`PREFIX=/usr/local bash <(curl -L ...)`), or `NO_INSTALL_ZIG=1` to make it refuse rather than fetch Zig.
+
+Already installed? Run:
+
+```sh
+zehn update
+```
+
+zehn checks GitHub master when it starts. If your binary was built from an older commit, it prints a short "update available" note. Set `ZEHN_NO_UPDATE_CHECK=1` if you want it quiet.
 
 Prefer to do it by hand? You'll need [Zig 0.16](https://ziglang.org/download/) or newer.
 
@@ -70,10 +78,13 @@ If you do not want it to launch anything, the other modes just print:
 zehn --print     # print the prompt text of whatever you select
 zehn --project   # print  agent <tab> project <tab> text
 zehn --list      # dump everything, no UI
+zehn update      # update to the latest master build
 zehn --version
 ```
 
-Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit.
+Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit. The search box has the usual readline-ish editing: left/right, Ctrl-left/right, Ctrl-U, Ctrl-K, Ctrl-backspace, and Ctrl-delete.
+
+Long prompts are a thing, especially if you use `/skill` blocks. Press Tab to focus the preview, PageUp/PageDown to scroll it, left/right to horizontally scroll the selected result, Ctrl-right/Ctrl-left to jump that result to the end/start, `W` to toggle wrapping, and `F` for a larger preview.
 
 Some prompts are worth keeping around. Press `^f` to favorite the selected one — it
 gets a `★` and floats to the top of every result list. Favorites live in
