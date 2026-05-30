@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
                 \\(run from the session's project directory)
                 \\
                 \\Keys: type to filter · ↑/↓ or ^p/^n move · Enter resume
-                \\      ^t filter by agent · ^f favorite · ^y copy prompt · ^o fork into another agent
+                \\      ^t agents · ^r projects · ^f favorite · ^y copy · ^o fork
                 \\      Esc/^c quit
                 \\
                 \\Favorites are stored in $XDG_CONFIG_HOME/zehn/favorites (or ~/.config/zehn).

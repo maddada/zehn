@@ -118,7 +118,10 @@ pub const Tui = struct {
     forking: bool = false,
     /// When set, the preview area becomes an agent-filter picker.
     filtering_agent: bool = false,
+    filtering_project: bool = false,
     filter_sel: usize = 0,
+    project_filter: ?[]const u8 = null,
+    project_sel: usize = 0,
 
     pub fn init(a: std.mem.Allocator, io: Io, records: []const scan.Record, fav: *favorites.Set, fav_path: []const u8) Tui {
         return .{
@@ -171,6 +174,7 @@ pub const Tui = struct {
         const q = self.query.items;
         for (self.records, 0..) |rec, i| {
             if (!self.agentAllowed(rec.agent)) continue;
+            if (self.project_filter) |p| if (!std.mem.eql(u8, rec.project, p)) continue;
             if (self.matcher.match(q, rec.text)) |m| {
                 const is_fav = self.fav.contains(favorites.key(rec.agent.label(), rec.text));
                 self.hits.append(self.a, .{ .idx = @intCast(i), .score = m.score, .fav = is_fav, .m = m }) catch oom();
@@ -262,7 +266,7 @@ pub const Tui = struct {
         b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch oom();
         self.writeQueryWithCursor(b);
         var cnt: [128]u8 = undefined;
-        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  ^t filter  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len }) catch "\r\n";
+        const cs = std.fmt.bufPrint(&cnt, "  \x1b[90m{d}/{d}  ·  ^t agents  ^r projects  ^f fav  ^y copy  ^o fork\x1b[0m\r\n", .{ self.hits.items.len, self.records.len }) catch "\r\n";
         b.appendSlice(self.a, cs) catch oom();
 
         const h = self.listHeight();
@@ -313,6 +317,13 @@ pub const Tui = struct {
         var k: usize = 0;
         while (k < self.cols) : (k += 1) b.appendSlice(self.a, "─") catch oom();
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+
+        if (self.filtering_project) {
+            self.writeProjectFilterPicker(b);
+            try w.writeAll(b.items);
+            try w.flush();
+            return;
+        }
 
         // agent filter mode replaces the preview with a small picker
         if (self.filtering_agent) {
@@ -402,6 +413,30 @@ pub const Tui = struct {
             while (i < n) {
                 const c = ibuf[i];
 
+                if (self.filtering_project) {
+                    if (c == 27) {
+                        if (self.handleEscapeSequence(ibuf[i..n])) |consumed| {
+                            i += consumed;
+                            continue;
+                        }
+                        self.filtering_project = false;
+                        i += 1;
+                        continue;
+                    }
+                    switch (c) {
+                        13, 10 => {
+                            self.applyProjectFilterSelection();
+                            self.filtering_project = false;
+                        },
+                        ' ' => self.toggleProjectFilterSelection(),
+                        14 => self.moveProjectSelection(1),
+                        16 => self.moveProjectSelection(-1),
+                        else => {},
+                    }
+                    i += 1;
+                    continue;
+                }
+
                 // While picking an agent filter, digits choose the filter and any
                 // other key (esc included) cancels back to normal browsing.
                 if (self.filtering_agent) {
@@ -488,6 +523,7 @@ pub const Tui = struct {
                         if (self.sel < self.hits.items.len) self.forking = true;
                     },
                     11 => self.killToEnd(), // ctrl-k
+                    18 => self.openProjectFilterPicker(), // ctrl-r
                     20 => self.openAgentFilterPicker(), // ctrl-t
                     21 => self.killToBeginning(), // ctrl-u
                     87, 119 => { // w/W
@@ -566,8 +602,8 @@ pub const Tui = struct {
             return 6;
         }
         switch (bytes[2]) {
-            'A' => if (self.filtering_agent) self.moveFilterSelection(-1) else self.moveUp(),
-            'B' => if (self.filtering_agent) self.moveFilterSelection(1) else self.moveDown(),
+            'A' => if (self.filtering_project) self.moveProjectSelection(-1) else if (self.filtering_agent) self.moveFilterSelection(-1) else self.moveUp(),
+            'B' => if (self.filtering_project) self.moveProjectSelection(1) else if (self.filtering_agent) self.moveFilterSelection(1) else self.moveDown(),
             'C' => if (self.preview_focus) self.scrollResult(8) else self.moveRight(),
             'D' => if (self.preview_focus) self.scrollResult(-8) else self.moveLeft(),
             else => {},
@@ -626,6 +662,7 @@ pub const Tui = struct {
         const pos = if (self.hits.items.len == 0) 0 else self.sel + 1;
         b.print(self.a, "  {d}/{d}", .{ pos, self.hits.items.len }) catch oom();
         self.writeAgentFilterStatus(b);
+        self.writeProjectFilterStatus(b);
         b.appendSlice(self.a, "\x1b[0m\r\n\r\n") catch oom();
     }
 
@@ -675,6 +712,10 @@ pub const Tui = struct {
         }
     }
 
+    fn writeProjectFilterStatus(self: *Tui, b: *std.ArrayList(u8)) void {
+        if (self.project_filter) |project| b.print(self.a, "  project:{s}", .{std.fs.path.basename(project)}) catch oom();
+    }
+
     fn agentBit(agent: scan.Agent) u4 {
         return switch (agent) {
             .claude => 1 << 0,
@@ -711,14 +752,90 @@ pub const Tui = struct {
         b.appendSlice(self.a, "\r\n") catch oom();
         const agents = [_]scan.Agent{ .claude, .codex, .pi, .opencode };
         for (agents, 0..) |agent, idx| {
-            b.appendSlice(self.a, if (idx == self.filter_sel) "→ " else "  ") catch oom();
-            b.appendSlice(self.a, agentColor(agent)) catch oom();
-            b.print(self.a, "{s}\x1b[0m", .{agent.label()}) catch oom();
             const selected = (self.agent_filter_mask & agentBit(agent)) != 0;
-            b.print(self.a, "\x1b[90m{s}\x1b[0m\r\n", .{if (selected) " ✓" else ""}) catch oom();
+            b.appendSlice(self.a, if (idx == self.filter_sel) "\x1b[1;36m→ " else "  ") catch oom();
+            b.print(self.a, "{s}\x1b[0m", .{agent.label()}) catch oom();
+            if (selected) b.appendSlice(self.a, "  \x1b[1;32m✓\x1b[0m") catch oom();
+            b.appendSlice(self.a, "\r\n") catch oom();
         }
         b.appendSlice(self.a, "\r\n\x1b[90mSelect none to show all agents.\x1b[0m\r\n") catch oom();
         b.appendSlice(self.a, "\r\n\x1b[90m↑/↓ or ^p/^n move · Enter/Space toggle · 1-4 quick toggle · Esc close\x1b[0m\r\n") catch oom();
+    }
+
+    fn projectIsFirst(self: *Tui, idx: usize) bool {
+        const p = self.records[idx].project;
+        for (self.records[0..idx]) |rec| if (std.mem.eql(u8, rec.project, p)) return false;
+        return true;
+    }
+
+    fn projectCount(self: *Tui) usize {
+        var count: usize = 1; // none/currently all projects
+        for (self.records, 0..) |_, i| {
+            if (self.projectIsFirst(i)) count += 1;
+        }
+        return count;
+    }
+
+    fn projectAt(self: *Tui, sel: usize) ?[]const u8 {
+        if (sel == 0) return null;
+        var n: usize = 1;
+        for (self.records, 0..) |rec, i| {
+            if (!self.projectIsFirst(i)) continue;
+            if (n == sel) return rec.project;
+            n += 1;
+        }
+        return null;
+    }
+
+    fn openProjectFilterPicker(self: *Tui) void {
+        self.filtering_project = true;
+        self.project_sel = 0;
+    }
+
+    fn moveProjectSelection(self: *Tui, delta: isize) void {
+        const count = self.projectCount();
+        if (count == 0) return;
+        if (delta < 0) {
+            self.project_sel = if (self.project_sel == 0) count - 1 else self.project_sel - 1;
+        } else {
+            self.project_sel = (self.project_sel + 1) % count;
+        }
+    }
+
+    fn applyProjectFilterSelection(self: *Tui) void {
+        self.project_filter = self.projectAt(self.project_sel);
+        self.recompute();
+    }
+
+    fn toggleProjectFilterSelection(self: *Tui) void {
+        const picked = self.projectAt(self.project_sel);
+        if (picked == null) {
+            self.project_filter = null;
+        } else if (self.project_filter) |cur| {
+            self.project_filter = if (std.mem.eql(u8, cur, picked.?)) null else picked;
+        } else {
+            self.project_filter = picked;
+        }
+        self.recompute();
+    }
+
+    fn writeProjectFilterPicker(self: *Tui, b: *std.ArrayList(u8)) void {
+        b.appendSlice(self.a, "\r\n") catch oom();
+        const count = self.projectCount();
+        var idx: usize = 0;
+        while (idx < count) : (idx += 1) {
+            const p = self.projectAt(idx);
+            b.appendSlice(self.a, if (idx == self.project_sel) "\x1b[1;36m→ " else "  ") catch oom();
+            const label = if (p) |path| (if (path.len > 0) std.fs.path.basename(path) else "-") else "all projects";
+            b.print(self.a, "{s}\x1b[0m", .{label}) catch oom();
+            const selected = if (p) |path| blk: {
+                if (self.project_filter) |cur| break :blk std.mem.eql(u8, cur, path);
+                break :blk false;
+            } else self.project_filter == null;
+            if (selected) b.appendSlice(self.a, "  \x1b[1;32m✓\x1b[0m") catch oom();
+            b.appendSlice(self.a, "\r\n") catch oom();
+        }
+        b.appendSlice(self.a, "\r\n\x1b[90m↑/↓ or ^p/^n move · Enter select · Space toggle · Esc close\x1b[0m\r\n") catch oom();
     }
 
     fn insertQueryByte(self: *Tui, c: u8) void {
