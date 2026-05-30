@@ -320,7 +320,7 @@ pub const Tui = struct {
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
 
         if (self.filtering_project) {
-            self.writeProjectFilterPicker(b);
+            self.writeProjectFilterPicker(b, 5);
             try w.writeAll(b.items);
             try w.flush();
             return;
@@ -328,7 +328,7 @@ pub const Tui = struct {
 
         // agent filter mode replaces the preview with a small picker
         if (self.filtering_agent) {
-            self.writeAgentFilterPicker(b);
+            self.writeAgentFilterPicker(b, 5);
             try w.writeAll(b.items);
             try w.flush();
             return;
@@ -752,10 +752,11 @@ pub const Tui = struct {
         self.recompute();
     }
 
-    fn writeAgentFilterPicker(self: *Tui, b: *std.ArrayList(u8)) void {
+    fn writeAgentFilterPicker(self: *Tui, b: *std.ArrayList(u8), max_rows: usize) void {
         b.appendSlice(self.a, "\r\n") catch oom();
         const agents = [_]scan.Agent{ .claude, .codex, .pi, .opencode };
-        for (agents, 0..) |agent, idx| {
+        const rows = @min(max_rows, agents.len);
+        for (agents[0..rows], 0..) |agent, idx| {
             const selected = (self.agent_filter_mask & agentBit(agent)) != 0;
             b.appendSlice(self.a, if (idx == self.filter_sel) "\x1b[1;36m→ " else "  ") catch oom();
             b.print(self.a, "{s}\x1b[0m", .{agent.label()}) catch oom();
@@ -780,21 +781,17 @@ pub const Tui = struct {
     }
 
     fn projectCount(self: *Tui) usize {
-        var count: usize = if (self.project_query.items.len == 0) 1 else 0; // all projects row
+        var count: usize = 0;
         for (self.records, 0..) |rec, i| {
-            if (self.projectIsFirst(i) and self.projectMatches(rec.project)) count += 1;
+            if (rec.project.len > 0 and self.projectIsFirst(i) and self.projectMatches(rec.project)) count += 1;
         }
         return count;
     }
 
     fn projectAt(self: *Tui, sel: usize) ?[]const u8 {
         var n: usize = 0;
-        if (self.project_query.items.len == 0) {
-            if (sel == 0) return null;
-            n = 1;
-        }
         for (self.records, 0..) |rec, i| {
-            if (!self.projectIsFirst(i) or !self.projectMatches(rec.project)) continue;
+            if (rec.project.len == 0 or !self.projectIsFirst(i) or !self.projectMatches(rec.project)) continue;
             if (n == sel) return rec.project;
             n += 1;
         }
@@ -850,17 +847,21 @@ pub const Tui = struct {
         self.project_sel = @min(self.project_sel, self.projectCount() -| 1);
     }
 
-    fn writeProjectFilterPicker(self: *Tui, b: *std.ArrayList(u8)) void {
+    fn writeProjectFilterPicker(self: *Tui, b: *std.ArrayList(u8), max_rows: usize) void {
         b.appendSlice(self.a, "\r\n") catch oom();
         b.appendSlice(self.a, "\x1b[1;36m> \x1b[0m") catch oom();
         b.appendSlice(self.a, self.project_query.items) catch oom();
         b.appendSlice(self.a, "\r\n\r\n") catch oom();
         const count = self.projectCount();
-        var idx: usize = 0;
-        while (idx < count) : (idx += 1) {
+        const rows_avail = if (max_rows > 3) max_rows - 3 else 1;
+        const visible = @min(rows_avail, count);
+        const start = if (count <= visible) 0 else @min(self.project_sel, count - visible);
+        var shown: usize = 0;
+        while (shown < visible) : (shown += 1) {
+            const idx = start + shown;
             const p = self.projectAt(idx);
             b.appendSlice(self.a, if (idx == self.project_sel) "\x1b[1;36m→ \x1b[0m" else "  ") catch oom();
-            const label = if (p) |path| (if (path.len > 0) std.fs.path.basename(path) else "-") else "all projects";
+            const label = if (p) |path| std.fs.path.basename(path) else "-";
             b.print(self.a, "{s}\x1b[0m", .{label}) catch oom();
             const selected = if (p) |path| blk: {
                 if (self.project_filter) |cur| break :blk std.mem.eql(u8, cur, path);
@@ -869,8 +870,9 @@ pub const Tui = struct {
             if (selected) b.appendSlice(self.a, "  \x1b[1;32m✓\x1b[0m") catch oom();
             b.appendSlice(self.a, "\r\n") catch oom();
         }
+        if (count > visible) b.print(self.a, "  \x1b[90m({d}/{d})\x1b[0m\r\n", .{ self.project_sel + 1, count }) catch oom();
         if (count == 0) b.appendSlice(self.a, "  \x1b[90mNo matching projects\x1b[0m\r\n") catch oom();
-        b.appendSlice(self.a, "\r\n\x1b[90mType to search · ↑/↓ or ^p/^n move · Enter select · Space toggle · Esc close\x1b[0m\r\n") catch oom();
+        b.appendSlice(self.a, "\r\n\x1b[90mType to search · ↑/↓ or ^p/^n move · Enter select · Space toggles/clears · Esc close\x1b[0m\r\n") catch oom();
     }
 
     fn insertQueryByte(self: *Tui, c: u8) void {
