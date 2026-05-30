@@ -418,28 +418,23 @@ pub const Tui = struct {
                             self.applyFilterSelection();
                             self.filtering_agent = false;
                         },
-                        '0' => {
+                        '1' => {
                             self.filter_sel = 0;
                             self.applyFilterSelection();
                             self.filtering_agent = false;
                         },
-                        '1' => {
+                        '2' => {
                             self.filter_sel = 1;
                             self.applyFilterSelection();
                             self.filtering_agent = false;
                         },
-                        '2' => {
+                        '3' => {
                             self.filter_sel = 2;
                             self.applyFilterSelection();
                             self.filtering_agent = false;
                         },
-                        '3' => {
-                            self.filter_sel = 3;
-                            self.applyFilterSelection();
-                            self.filtering_agent = false;
-                        },
                         '4' => {
-                            self.filter_sel = 4;
+                            self.filter_sel = 3;
                             self.applyFilterSelection();
                             self.filtering_agent = false;
                         },
@@ -635,21 +630,20 @@ pub const Tui = struct {
 
     fn filterSelectionAgent(sel: usize) ?scan.Agent {
         return switch (sel) {
-            0 => null,
-            1 => .claude,
-            2 => .codex,
-            3 => .pi,
-            4 => .opencode,
+            0 => .claude,
+            1 => .codex,
+            2 => .pi,
+            3 => .opencode,
             else => null,
         };
     }
 
     fn agentFilterSelection(self: *const Tui) usize {
         return if (self.agent_filter) |agent| switch (agent) {
-            .claude => 1,
-            .codex => 2,
-            .pi => 3,
-            .opencode => 4,
+            .claude => 0,
+            .codex => 1,
+            .pi => 2,
+            .opencode => 3,
         } else 0;
     }
 
@@ -660,9 +654,9 @@ pub const Tui = struct {
 
     fn moveFilterSelection(self: *Tui, delta: isize) void {
         if (delta < 0) {
-            self.filter_sel = if (self.filter_sel == 0) 4 else self.filter_sel - 1;
+            self.filter_sel = if (self.filter_sel == 0) 3 else self.filter_sel - 1;
         } else {
-            self.filter_sel = (self.filter_sel + 1) % 5;
+            self.filter_sel = (self.filter_sel + 1) % 4;
         }
     }
 
@@ -671,14 +665,15 @@ pub const Tui = struct {
     }
 
     fn writeAgentFilterPicker(self: *Tui, b: *std.ArrayList(u8)) void {
-        b.appendSlice(self.a, "\x1b[1;36mfilter by agent:\x1b[0m\r\n") catch oom();
-        const labels = [_][]const u8{ "all", "claude", "codex", "pi", "opencode" };
-        for (labels, 0..) |label, idx| {
-            if (idx == self.filter_sel) b.appendSlice(self.a, "\x1b[7m") catch oom();
-            b.print(self.a, "  {d} {s}  ", .{ idx, label }) catch oom();
-            if (idx == self.filter_sel) b.appendSlice(self.a, "\x1b[0m") catch oom();
+        b.appendSlice(self.a, "\r\n") catch oom();
+        const agents = [_]scan.Agent{ .claude, .codex, .pi, .opencode };
+        for (agents, 0..) |agent, idx| {
+            b.appendSlice(self.a, if (idx == self.filter_sel) "→ " else "  ") catch oom();
+            b.appendSlice(self.a, agentColor(agent)) catch oom();
+            b.print(self.a, "▌ {s}\x1b[0m\r\n", .{agent.label()}) catch oom();
         }
-        b.appendSlice(self.a, "\r\n\x1b[90m↑/↓ or ^p/^n move · Enter select · 0-4 quick select · Esc cancel\x1b[0m\r\n") catch oom();
+        b.print(self.a, "\r\n\x1b[90mCurrent filter: {s}\x1b[0m\r\n", .{self.agentFilterLabel()}) catch oom();
+        b.appendSlice(self.a, "\r\n\x1b[90m↑/↓ or ^p/^n move · Enter select · 1-4 quick select · Esc cancel\x1b[0m\r\n") catch oom();
     }
 
     fn cycleAgentFilter(self: *Tui) void {
@@ -964,21 +959,19 @@ test "interactive agent filter picker filters hits" {
     try testing.expectEqualStrings("all", tui.agentFilterLabel());
 
     tui.openAgentFilterPicker();
-    tui.moveFilterSelection(1);
-    try testing.expectEqual(@as(usize, 1), tui.filter_sel);
+    try testing.expectEqual(@as(usize, 0), tui.filter_sel);
     tui.applyFilterSelection();
     try testing.expectEqual(scan.Agent.claude, tui.agent_filter.?);
     try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
     try testing.expectEqual(scan.Agent.claude, records[tui.hits.items[0].idx].agent);
 
-    tui.filter_sel = 4;
+    tui.filter_sel = 3;
     tui.applyFilterSelection();
     try testing.expectEqual(scan.Agent.opencode, tui.agent_filter.?);
     try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
     try testing.expectEqual(scan.Agent.opencode, records[tui.hits.items[0].idx].agent);
 
-    tui.filter_sel = 0;
-    tui.applyFilterSelection();
+    tui.setAgentFilter(null);
     try testing.expect(tui.agent_filter == null);
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
 }
