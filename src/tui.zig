@@ -335,6 +335,7 @@ pub const Tui = struct {
         // preview of selected
         if (self.sel < self.hits.items.len) {
             const rec = self.records[self.hits.items[self.sel].idx];
+            self.writeProjectLine(b, rec);
             const preview_lines: usize = if (self.fullscreen_preview) self.rows -| 3 else 4;
             if (self.preview_focus) b.appendSlice(self.a, "\x1b[1;36mpreview\x1b[0m\r\n") catch oom();
             // preview lines, wrapped at display width when enabled, UTF-8 aware
@@ -370,7 +371,7 @@ pub const Tui = struct {
                 line_lines += 1;
                 if (i == line_start and used == 0) i += 1; // guarantee progress
             }
-            self.writeStatusLine(b, rec);
+            self.writeMetadataLine(b, rec);
         }
 
         try w.writeAll(b.items);
@@ -617,13 +618,18 @@ pub const Tui = struct {
         return pos + uni.decode(q[pos..]).len;
     }
 
-    fn writeStatusLine(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record) void {
+    fn writeProjectLine(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record) void {
         const project = if (rec.project.len > 0) rec.project else "-";
+        b.appendSlice(self.a, "\x1b[90m") catch oom();
+        b.appendSlice(self.a, project) catch oom();
+        if (self.gitBranch(rec.project)) |branch| b.print(self.a, " ({s})", .{branch}) catch oom();
         const pos = if (self.hits.items.len == 0) 0 else self.sel + 1;
-        b.print(self.a, "\x1b[90m{s}  {d}/{d}", .{ project, pos, self.hits.items.len }) catch oom();
+        b.print(self.a, "  {d}/{d}", .{ pos, self.hits.items.len }) catch oom();
         self.writeAgentFilterStatus(b);
-        b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+        b.appendSlice(self.a, "\x1b[0m\r\n\r\n") catch oom();
+    }
 
+    fn writeMetadataLine(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record) void {
         b.appendSlice(self.a, "\x1b[90m") catch oom();
         self.writeUsageStatus(b, rec.meta.usage);
         if (rec.meta.plan.len > 0) b.print(self.a, "({s}) ", .{rec.meta.plan}) catch oom();
@@ -636,6 +642,16 @@ pub const Tui = struct {
         }
         if (rec.meta.thinking.len > 0) b.print(self.a, " • {s}", .{rec.meta.thinking}) catch oom();
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+    }
+
+    fn gitBranch(self: *Tui, project: []const u8) ?[]const u8 {
+        if (project.len == 0) return null;
+        const head_path = std.fmt.allocPrint(self.a, "{s}/.git/HEAD", .{project}) catch return null;
+        const data = Io.Dir.cwd().readFileAlloc(self.io, head_path, self.a, .limited(4096)) catch return null;
+        const trimmed = std.mem.trim(u8, data, " \t\r\n");
+        const prefix = "ref: refs/heads/";
+        if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+        return trimmed[prefix.len..];
     }
 
     fn writeUsageStatus(self: *Tui, b: *std.ArrayList(u8), u: scan.Usage) void {
