@@ -122,6 +122,7 @@ pub const Tui = struct {
     filter_sel: usize = 0,
     project_filter: ?[]const u8 = null,
     project_sel: usize = 0,
+    project_query: std.ArrayList(u8) = .empty,
 
     pub fn init(a: std.mem.Allocator, io: Io, records: []const scan.Record, fav: *favorites.Set, fav_path: []const u8) Tui {
         return .{
@@ -429,9 +430,12 @@ pub const Tui = struct {
                             self.filtering_project = false;
                         },
                         ' ' => self.toggleProjectFilterSelection(),
+                        127, 8 => self.backspaceProjectQuery(),
                         14 => self.moveProjectSelection(1),
                         16 => self.moveProjectSelection(-1),
-                        else => {},
+                        else => {
+                            if ((c >= 32 and c < 127) or c >= 128) self.insertProjectQueryByte(c);
+                        },
                     }
                     i += 1;
                     continue;
@@ -768,19 +772,29 @@ pub const Tui = struct {
         return true;
     }
 
+    fn projectMatches(self: *Tui, project: []const u8) bool {
+        const q = self.project_query.items;
+        if (q.len == 0) return true;
+        const base = std.fs.path.basename(project);
+        return std.ascii.indexOfIgnoreCase(base, q) != null or std.ascii.indexOfIgnoreCase(project, q) != null;
+    }
+
     fn projectCount(self: *Tui) usize {
-        var count: usize = 1; // none/currently all projects
-        for (self.records, 0..) |_, i| {
-            if (self.projectIsFirst(i)) count += 1;
+        var count: usize = if (self.project_query.items.len == 0) 1 else 0; // all projects row
+        for (self.records, 0..) |rec, i| {
+            if (self.projectIsFirst(i) and self.projectMatches(rec.project)) count += 1;
         }
         return count;
     }
 
     fn projectAt(self: *Tui, sel: usize) ?[]const u8 {
-        if (sel == 0) return null;
-        var n: usize = 1;
+        var n: usize = 0;
+        if (self.project_query.items.len == 0) {
+            if (sel == 0) return null;
+            n = 1;
+        }
         for (self.records, 0..) |rec, i| {
-            if (!self.projectIsFirst(i)) continue;
+            if (!self.projectIsFirst(i) or !self.projectMatches(rec.project)) continue;
             if (n == sel) return rec.project;
             n += 1;
         }
@@ -790,6 +804,7 @@ pub const Tui = struct {
     fn openProjectFilterPicker(self: *Tui) void {
         self.filtering_project = true;
         self.project_sel = 0;
+        self.project_query.clearRetainingCapacity();
     }
 
     fn moveProjectSelection(self: *Tui, delta: isize) void {
@@ -819,13 +834,32 @@ pub const Tui = struct {
         self.recompute();
     }
 
+    fn insertProjectQueryByte(self: *Tui, c: u8) void {
+        self.project_query.append(self.a, c) catch oom();
+        self.project_sel = 0;
+    }
+
+    fn backspaceProjectQuery(self: *Tui) void {
+        if (self.project_query.items.len == 0) return;
+        _ = self.project_query.pop();
+        while (self.project_query.items.len > 0 and
+            (self.project_query.items[self.project_query.items.len - 1] & 0xC0) == 0x80)
+        {
+            _ = self.project_query.pop();
+        }
+        self.project_sel = @min(self.project_sel, self.projectCount() -| 1);
+    }
+
     fn writeProjectFilterPicker(self: *Tui, b: *std.ArrayList(u8)) void {
         b.appendSlice(self.a, "\r\n") catch oom();
+        b.appendSlice(self.a, "\x1b[1;36m> \x1b[0m") catch oom();
+        b.appendSlice(self.a, self.project_query.items) catch oom();
+        b.appendSlice(self.a, "\r\n\r\n") catch oom();
         const count = self.projectCount();
         var idx: usize = 0;
         while (idx < count) : (idx += 1) {
             const p = self.projectAt(idx);
-            b.appendSlice(self.a, if (idx == self.project_sel) "\x1b[1;36m→ " else "  ") catch oom();
+            b.appendSlice(self.a, if (idx == self.project_sel) "\x1b[1;36m→ \x1b[0m" else "  ") catch oom();
             const label = if (p) |path| (if (path.len > 0) std.fs.path.basename(path) else "-") else "all projects";
             b.print(self.a, "{s}\x1b[0m", .{label}) catch oom();
             const selected = if (p) |path| blk: {
@@ -835,7 +869,8 @@ pub const Tui = struct {
             if (selected) b.appendSlice(self.a, "  \x1b[1;32m✓\x1b[0m") catch oom();
             b.appendSlice(self.a, "\r\n") catch oom();
         }
-        b.appendSlice(self.a, "\r\n\x1b[90m↑/↓ or ^p/^n move · Enter select · Space toggle · Esc close\x1b[0m\r\n") catch oom();
+        if (count == 0) b.appendSlice(self.a, "  \x1b[90mNo matching projects\x1b[0m\r\n") catch oom();
+        b.appendSlice(self.a, "\r\n\x1b[90mType to search · ↑/↓ or ^p/^n move · Enter select · Space toggle · Esc close\x1b[0m\r\n") catch oom();
     }
 
     fn insertQueryByte(self: *Tui, c: u8) void {
