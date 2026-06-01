@@ -1,0 +1,4 @@
+# CDXC:Toolchain 2026-06-01-10:45:
+# zehn's build.zig.zon requires Zig 0.16.0. Keep this project-local mise pin separate from zmx so each repository resolves the Zig version its build graph expects.
+[tools]
+zig = "0.16.0"
