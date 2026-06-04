@@ -77,6 +77,7 @@ If you do not want it to launch anything, the other modes just print:
 ```sh
 zehn --print     # print the prompt text of whatever you select
 zehn --project   # print  agent <tab> project <tab> text
+zehn --accept-all     # resume supported agents with permission-bypass flags
 zehn --agent claude   # only show one agent: claude, codex, pi, or opencode
 zehn --opencode       # shorthand for --agent opencode
 zehn --list      # dump everything, no UI
@@ -108,9 +109,18 @@ at another.
 | pi       | `~/.pi/agent/sessions/*/*.jsonl`               | `pi --session <id>`       |
 | opencode | `~/.local/share/opencode/opencode.db` (SQLite) | `opencode --session <id>` |
 
+With `--accept-all`, supported resume commands add the same permission-bypass
+flags Ghostex uses: `codex --yolo`, `claude --dangerously-skip-permissions`,
+and `opencode --dangerously-skip-permissions`. `pi` has no Accept All flag.
+
 Each agent shows up in its own brand color, so you can tell at a glance whether a result came from claude or codex. Duplicate prompts collapse into one (keeping the most recent), and when two results score the same, the newer one wins.
 
 opencode keeps its history in a SQLite database, so reading it needs the `sqlite3` CLI on your `PATH`. If it is missing, zehn skips opencode and says so instead of failing.
+
+Codex session files can get large. zehn keeps a derived cache of extracted Codex
+user prompts in `~/.ghostex/zehn/codex-sessions-v1`, invalidated by each source
+file's size and modified time. The original session files remain the source of
+truth, and the cache can be deleted at any time.
 
 ## How matching works
 
