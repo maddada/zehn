@@ -27,6 +27,9 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(a);
     var print_project = false;
     var print_only = false;
+    // CDXC:AgentHistorySearch 2026-06-04-23:31:
+    // Ghostex users can resume agent history from zehn while their app-wide Accept All policy is enabled. Keep standalone zehn opt-in with an explicit CLI flag so the search tool does not depend on gxserver state.
+    var accept_all_resume = false;
     var agent_filter: ?scan.Agent = null;
     var arg_i: usize = 1;
     while (arg_i < args.len) : (arg_i += 1) {
@@ -52,6 +55,10 @@ pub fn main(init: std.process.Init) !void {
             agent_filter = parseAgent(arg[8..]) orelse return usageError(w, "unknown agent");
         } else if (parseAgentFlag(arg)) |agent| {
             agent_filter = agent;
+        } else if (std.mem.eql(u8, arg, "--accept-all")) {
+            accept_all_resume = true;
+        } else if (std.mem.eql(u8, arg, "--no-accept-all")) {
+            accept_all_resume = false;
         } else if (std.mem.eql(u8, arg, "--print")) {
             print_only = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -67,11 +74,14 @@ pub fn main(init: std.process.Init) !void {
                 \\  zehn --project  print agent<TAB>project<TAB>text (implies --print)
                 \\  zehn --agent claude   show only one agent (claude/codex/pi/opencode)
                 \\  zehn --claude         shorthand for --agent claude
+                \\  zehn --accept-all     resume with supported permission-bypass flags
                 \\  zehn update     update zehn from the latest master build
                 \\  zehn --list     dump all records
                 \\
-                \\Resume:  claude --resume <id> | codex resume <id>
-                \\         pi --session <id> | opencode --session <id>
+                \\Resume:  claude [--dangerously-skip-permissions] --resume <id>
+                \\         codex [--yolo] resume <id>
+                \\         pi --session <id>
+                \\         opencode [--dangerously-skip-permissions] --session <id>
                 \\(run from the session's project directory)
                 \\
                 \\Keys: type to filter · ↑/↓ or ^p/^n move · Enter resume
@@ -129,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         switch (action.kind) {
-            .resume_session => try resumeSession(init, io, w, rec),
+            .resume_session => try resumeSession(init, io, w, rec, accept_all_resume),
             .copy => try copyPrompt(io, w, rec),
             .view => try viewPrompt(init, io, w, rec),
             .fork => try forkSession(init, io, w, rec, action.fork_agent),
@@ -139,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn usageError(w: *Io.Writer, msg: []const u8) !void {
     try w.print("zehn: {s}\n", .{msg});
-    try w.writeAll("usage: zehn [--agent claude|codex|pi|opencode] [--print|--project|--list]\n");
+    try w.writeAll("usage: zehn [--agent claude|codex|pi|opencode] [--accept-all|--no-accept-all] [--print|--project|--list]\n");
     try w.flush();
 }
 
@@ -332,20 +342,41 @@ fn forkSession(init: std.process.Init, io: Io, w: *Io.Writer, rec: scan.Record, 
     _ = try child.wait(io);
 }
 
-fn resumeSession(init: std.process.Init, io: Io, w: *Io.Writer, rec: scan.Record) !void {
+const ResumeArgv = struct {
+    items: [4][]const u8 = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const ResumeArgv) []const []const u8 {
+        return self.items[0..self.len];
+    }
+};
+
+fn resumeArgv(agent: scan.Agent, session: []const u8, accept_all: bool) ResumeArgv {
+    if (accept_all) {
+        return switch (agent) {
+            .claude => .{ .items = .{ "claude", "--dangerously-skip-permissions", "--resume", session }, .len = 4 },
+            .codex => .{ .items = .{ "codex", "--yolo", "resume", session }, .len = 4 },
+            .pi => .{ .items = .{ "pi", "--session", session, undefined }, .len = 3 },
+            .opencode => .{ .items = .{ "opencode", "--dangerously-skip-permissions", "--session", session }, .len = 4 },
+        };
+    }
+    return switch (agent) {
+        .claude => .{ .items = .{ "claude", "--resume", session, undefined }, .len = 3 },
+        .codex => .{ .items = .{ "codex", "resume", session, undefined }, .len = 3 },
+        .pi => .{ .items = .{ "pi", "--session", session, undefined }, .len = 3 },
+        .opencode => .{ .items = .{ "opencode", "--session", session, undefined }, .len = 3 },
+    };
+}
+
+fn resumeSession(init: std.process.Init, io: Io, w: *Io.Writer, rec: scan.Record, accept_all: bool) !void {
     if (rec.session.len == 0) {
         try w.print("zehn: no session id recorded for this {s} entry\n", .{rec.agent.label()});
         try w.flush();
         return;
     }
 
-    // Build the agent-specific resume argv.
-    const argv: []const []const u8 = switch (rec.agent) {
-        .claude => &.{ "claude", "--resume", rec.session },
-        .codex => &.{ "codex", "resume", rec.session },
-        .pi => &.{ "pi", "--session", rec.session },
-        .opencode => &.{ "opencode", "--session", rec.session },
-    };
+    const argv_buf = resumeArgv(rec.agent, rec.session, accept_all);
+    const argv = argv_buf.slice();
 
     // Resume from the recorded project dir, but fall back to the current dir
     // if it no longer exists (moved/deleted), rather than failing the spawn.
@@ -374,15 +405,59 @@ fn resumeSession(init: std.process.Init, io: Io, w: *Io.Writer, rec: scan.Record
         .cwd = cwd,
         .environ_map = init.environ_map,
     }) catch |err| {
-        try w.print("zehn: failed to launch {s} ({t})\nRun manually:\n  cd {s} && {s} {s} {s}\n", .{
-            argv[0],                                       err,
-            if (rec.project.len > 0) rec.project else ".", argv[0],
-            argv[1],                                       argv[2],
+        try w.print("zehn: failed to launch {s} ({t})\nRun manually:\n  cd {s} &&", .{
+            argv[0],
+            err,
+            if (rec.project.len > 0) rec.project else ".",
         });
+        for (argv) |part| {
+            try w.print(" {s}", .{part});
+        }
+        try w.writeAll("\n");
         try w.flush();
         return;
     };
     _ = try child.wait(io);
+}
+
+test "resume argv optionally applies Ghostex Accept All flags" {
+    {
+        const argv_buf = resumeArgv(.codex, "codex-session", false);
+        const argv = argv_buf.slice();
+        try std.testing.expectEqual(@as(usize, 3), argv.len);
+        try std.testing.expectEqualStrings("codex", argv[0]);
+        try std.testing.expectEqualStrings("resume", argv[1]);
+        try std.testing.expectEqualStrings("codex-session", argv[2]);
+    }
+    {
+        const argv_buf = resumeArgv(.codex, "codex-session", true);
+        const argv = argv_buf.slice();
+        try std.testing.expectEqual(@as(usize, 4), argv.len);
+        try std.testing.expectEqualStrings("codex", argv[0]);
+        try std.testing.expectEqualStrings("--yolo", argv[1]);
+        try std.testing.expectEqualStrings("resume", argv[2]);
+        try std.testing.expectEqualStrings("codex-session", argv[3]);
+    }
+    {
+        const argv_buf = resumeArgv(.claude, "claude-session", true);
+        const argv = argv_buf.slice();
+        try std.testing.expectEqualStrings("--dangerously-skip-permissions", argv[1]);
+        try std.testing.expectEqualStrings("--resume", argv[2]);
+    }
+    {
+        const argv_buf = resumeArgv(.opencode, "opencode-session", true);
+        const argv = argv_buf.slice();
+        try std.testing.expectEqualStrings("--dangerously-skip-permissions", argv[1]);
+        try std.testing.expectEqualStrings("--session", argv[2]);
+    }
+    {
+        const argv_buf = resumeArgv(.pi, "pi-session", true);
+        const argv = argv_buf.slice();
+        try std.testing.expectEqual(@as(usize, 3), argv.len);
+        try std.testing.expectEqualStrings("pi", argv[0]);
+        try std.testing.expectEqualStrings("--session", argv[1]);
+        try std.testing.expectEqualStrings("pi-session", argv[2]);
+    }
 }
 
 fn writeSanitized(w: *Io.Writer, text: []const u8) !void {
