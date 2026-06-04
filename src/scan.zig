@@ -52,6 +52,16 @@ pub const Record = struct {
     meta: Meta = .{},
 };
 
+// CDXC:AgentHistorySearch 2026-06-04-23:31:
+// Codex session files can total multiple gigabytes while zehn only needs extracted user prompts and session metadata at launch.
+// Store a disposable derived cache under ~/.ghostex/zehn and invalidate each cached session by the source file's size and modified time so unchanged sessions do not get reparsed on every startup.
+const codex_cache_version = 1;
+
+const SourceStamp = struct {
+    size_text: []const u8,
+    mtime_text: []const u8,
+};
+
 pub const Scanner = struct {
     a: std.mem.Allocator,
     io: Io,
@@ -194,12 +204,150 @@ pub const Scanner = struct {
                     while (files.next(self.io) catch null) |fe| {
                         if (fe.kind != .file or !std.mem.endsWith(u8, fe.name, ".jsonl")) continue;
                         const full = std.fmt.allocPrint(self.a, "{s}/{s}/{s}/{s}/{s}", .{ base, ye.name, me.name, de.name, fe.name }) catch continue;
-                        const data = self.readAll(full) orelse continue;
-                        self.parseCodexSession(data);
+                        self.scanCodexSessionCached(full);
                     }
                 }
             }
         }
+    }
+
+    fn scanCodexSessionCached(self: *Scanner, source_path: []const u8) void {
+        const stat = Io.Dir.cwd().statFile(self.io, source_path, .{}) catch return;
+        const stamp = self.stampFromStat(stat) orelse {
+            _ = self.scanCodexSessionUncached(source_path);
+            return;
+        };
+        const cache_path = self.codexCachePath(source_path) orelse {
+            _ = self.scanCodexSessionUncached(source_path);
+            return;
+        };
+        if (self.readAll(cache_path)) |data| {
+            if (self.parseCodexCache(data, source_path, stamp)) return;
+        }
+        const record_start = self.records.items.len;
+        if (self.scanCodexSessionUncached(source_path)) {
+            self.saveCodexCache(cache_path, source_path, stamp, self.records.items[record_start..]);
+        }
+    }
+
+    fn scanCodexSessionUncached(self: *Scanner, source_path: []const u8) bool {
+        const data = self.readAll(source_path) orelse return false;
+        self.parseCodexSession(data);
+        return true;
+    }
+
+    fn stampFromStat(self: *Scanner, stat: Io.File.Stat) ?SourceStamp {
+        return .{
+            .size_text = std.fmt.allocPrint(self.a, "{d}", .{stat.size}) catch return null,
+            .mtime_text = std.fmt.allocPrint(self.a, "{d}", .{stat.mtime.nanoseconds}) catch return null,
+        };
+    }
+
+    fn codexCachePath(self: *Scanner, source_path: []const u8) ?[]const u8 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(source_path);
+        const id = h.final();
+        return std.fmt.allocPrint(self.a, "{s}/.ghostex/zehn/codex-sessions-v1/{x:0>16}.jsonl", .{ self.home, id }) catch null;
+    }
+
+    fn saveCodexCache(self: *Scanner, cache_path: []const u8, source_path: []const u8, stamp: SourceStamp, records: []const Record) void {
+        const bytes = self.buildCodexCache(source_path, stamp, records) catch return;
+        if (std.fs.path.dirname(cache_path)) |dir| {
+            Io.Dir.cwd().createDirPath(self.io, dir) catch return;
+        }
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = cache_path, .data = bytes }) catch {};
+    }
+
+    fn buildCodexCache(self: *Scanner, source_path: []const u8, stamp: SourceStamp, records: []const Record) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.a);
+        try buf.print(self.a, "{f}\n", .{json.fmt(.{
+            .kind = "header",
+            .version = codex_cache_version,
+            .source = source_path,
+            .source_size = stamp.size_text,
+            .source_mtime_ns = stamp.mtime_text,
+        }, .{})});
+        for (records) |rec| {
+            try buf.print(self.a, "{f}\n", .{json.fmt(.{
+                .kind = "record",
+                .text = rec.text,
+                .project = rec.project,
+                .session = rec.session,
+                .provider = rec.meta.provider,
+                .model = rec.meta.model,
+                .thinking = rec.meta.thinking,
+                .plan = rec.meta.plan,
+                .input = rec.meta.usage.input,
+                .output = rec.meta.usage.output,
+                .cache_read = rec.meta.usage.cache_read,
+                .cache_write = rec.meta.usage.cache_write,
+                .total = rec.meta.usage.total,
+                .context_window = rec.meta.usage.context_window,
+                .rate_percent = rec.meta.usage.rate_percent,
+                .cost = rec.meta.usage.cost,
+            }, .{})});
+        }
+        try buf.print(self.a, "{f}\n", .{json.fmt(.{ .kind = "footer" }, .{})});
+        return buf.toOwnedSlice(self.a);
+    }
+
+    fn parseCodexCache(self: *Scanner, data: []const u8, source_path: []const u8, stamp: SourceStamp) bool {
+        const record_start = self.records.items.len;
+        var it = std.mem.splitScalar(u8, data, '\n');
+        const header_line = it.next() orelse return false;
+        const header = self.parseLine(header_line) orelse return false;
+        if (!self.codexCacheHeaderMatches(header, source_path, stamp)) return false;
+
+        var saw_footer = false;
+        while (it.next()) |line| {
+            const v = self.parseLine(line) orelse continue;
+            if (v != .object) continue;
+            const kind = stringField(v, "kind") orelse continue;
+            if (std.mem.eql(u8, kind, "footer")) {
+                saw_footer = true;
+                break;
+            }
+            if (!std.mem.eql(u8, kind, "record")) continue;
+            const text = stringField(v, "text") orelse continue;
+            if (text.len == 0) continue;
+            self.add(.{
+                .agent = .codex,
+                .text = text,
+                .project = stringField(v, "project") orelse "",
+                .session = stringField(v, "session") orelse "",
+                .ts = 0,
+                .meta = .{
+                    .provider = stringField(v, "provider") orelse "",
+                    .model = stringField(v, "model") orelse "",
+                    .thinking = stringField(v, "thinking") orelse "",
+                    .plan = stringField(v, "plan") orelse "",
+                    .usage = .{
+                        .input = intVal(fieldValue(v, "input") orelse .{ .integer = 0 }),
+                        .output = intVal(fieldValue(v, "output") orelse .{ .integer = 0 }),
+                        .cache_read = intVal(fieldValue(v, "cache_read") orelse .{ .integer = 0 }),
+                        .cache_write = intVal(fieldValue(v, "cache_write") orelse .{ .integer = 0 }),
+                        .total = intVal(fieldValue(v, "total") orelse .{ .integer = 0 }),
+                        .context_window = intVal(fieldValue(v, "context_window") orelse .{ .integer = 0 }),
+                        .rate_percent = floatVal(fieldValue(v, "rate_percent") orelse .{ .integer = 0 }),
+                        .cost = floatVal(fieldValue(v, "cost") orelse .{ .integer = 0 }),
+                    },
+                },
+            });
+        }
+        if (saw_footer) return true;
+        self.records.shrinkRetainingCapacity(record_start);
+        return false;
+    }
+
+    fn codexCacheHeaderMatches(_: *Scanner, v: json.Value, source_path: []const u8, stamp: SourceStamp) bool {
+        if (!std.mem.eql(u8, stringField(v, "kind") orelse return false, "header")) return false;
+        const version = fieldValue(v, "version") orelse return false;
+        if (version != .integer or version.integer != codex_cache_version) return false;
+        if (!std.mem.eql(u8, stringField(v, "source") orelse return false, source_path)) return false;
+        if (!std.mem.eql(u8, stringField(v, "source_size") orelse return false, stamp.size_text)) return false;
+        if (!std.mem.eql(u8, stringField(v, "source_mtime_ns") orelse return false, stamp.mtime_text)) return false;
+        return true;
     }
 
     /// Parse `~/.codex/history.jsonl` content.
@@ -330,6 +478,17 @@ pub const Scanner = struct {
             .float => |f| f,
             else => 0,
         };
+    }
+
+    fn fieldValue(v: json.Value, name: []const u8) ?json.Value {
+        if (v != .object) return null;
+        return v.object.get(name);
+    }
+
+    fn stringField(v: json.Value, name: []const u8) ?[]const u8 {
+        const x = fieldValue(v, name) orelse return null;
+        if (x != .string) return null;
+        return x.string;
     }
 
     fn applyMetaToSessionRecords(self: *Scanner, start: usize, meta: Meta) void {
@@ -539,6 +698,62 @@ test "parse codex history" {
     try testing.expectEqualStrings("abc", sc.records.items[0].session);
     try testing.expectEqual(@as(i64, 1779186371), sc.records.items[0].ts);
     try testing.expectEqual(Agent.codex, sc.records.items[0].agent);
+}
+
+test "codex cache round-trips records and rejects stale source metadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var writer_sc = testScanner(a);
+    const stamp = SourceStamp{ .size_text = "1234", .mtime_text = "1779186371000000000" };
+    const source = "/home/x/.codex/sessions/2026/06/04/session.jsonl";
+    const records = [_]Record{
+        .{
+            .agent = .codex,
+            .text = "cached user prompt",
+            .project = "/work/proj",
+            .session = "sess-1",
+            .ts = 0,
+            .meta = .{
+                .provider = "openai",
+                .model = "gpt-test",
+                .plan = "plus",
+                .usage = .{ .input = 10, .output = 20, .total = 30, .context_window = 200000, .rate_percent = 12.5, .cost = 0.25 },
+            },
+        },
+    };
+    const cache_data = try writer_sc.buildCodexCache(source, stamp, &records);
+
+    var reader_sc = testScanner(a);
+    try testing.expect(reader_sc.parseCodexCache(cache_data, source, stamp));
+    try testing.expectEqual(@as(usize, 1), reader_sc.records.items.len);
+    const rec = reader_sc.records.items[0];
+    try testing.expectEqual(Agent.codex, rec.agent);
+    try testing.expectEqualStrings("cached user prompt", rec.text);
+    try testing.expectEqualStrings("/work/proj", rec.project);
+    try testing.expectEqualStrings("sess-1", rec.session);
+    try testing.expectEqualStrings("openai", rec.meta.provider);
+    try testing.expectEqual(@as(u64, 30), rec.meta.usage.total);
+    try testing.expectEqual(@as(f64, 12.5), rec.meta.usage.rate_percent);
+
+    var stale_sc = testScanner(a);
+    try testing.expect(!stale_sc.parseCodexCache(cache_data, source, .{ .size_text = "9999", .mtime_text = stamp.mtime_text }));
+    try testing.expectEqual(@as(usize, 0), stale_sc.records.items.len);
+}
+
+test "codex cache without footer rolls back appended records" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    try sc.records.append(sc.a, .{ .agent = .claude, .text = "keep", .project = "", .session = "old", .ts = 1 });
+    const stamp = SourceStamp{ .size_text = "100", .mtime_text = "200" };
+    const data =
+        \\{"kind":"header","version":1,"source":"/source.jsonl","source_size":"100","source_mtime_ns":"200"}
+        \\{"kind":"record","text":"partial","project":"/p","session":"s","provider":"","model":"","thinking":"","plan":"","input":0,"output":0,"cache_read":0,"cache_write":0,"total":0,"context_window":0,"rate_percent":0,"cost":0}
+    ;
+    try testing.expect(!sc.parseCodexCache(data, "/source.jsonl", stamp));
+    try testing.expectEqual(@as(usize, 1), sc.records.items.len);
+    try testing.expectEqualStrings("keep", sc.records.items[0].text);
 }
 
 test "parse pi session: only user messages, session id + cwd captured" {
