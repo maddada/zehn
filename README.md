@@ -22,16 +22,18 @@ Find any prompt you have ever typed to an AI coding agent, then drop back into t
   <a href="https://www.anthropic.com/claude-code"><kbd><img src="https://www.google.com/s2/favicons?domain=claude.ai&sz=64" width="14" valign="middle" /> Claude Code</kbd></a> &nbsp;
   <a href="https://github.com/openai/codex"><kbd><img src="https://www.google.com/s2/favicons?domain=openai.com&sz=64" width="14" valign="middle" /> Codex</kbd></a> &nbsp;
   <a href="https://pi.dev"><kbd><img src="https://pi.dev/favicon.svg" width="14" valign="middle" /> pi</kbd></a> &nbsp;
-  <a href="https://opencode.ai"><kbd><img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=64" width="14" valign="middle" /> opencode</kbd></a>
+  <a href="https://opencode.ai"><kbd><img src="https://www.google.com/s2/favicons?domain=opencode.ai&sz=64" width="14" valign="middle" /> opencode</kbd></a> &nbsp;
+  <kbd>Cursor Agent</kbd> &nbsp;
+  <kbd>Grok</kbd>
 </p>
 
 </div>
 
 ## What is this?
 
-You use claude one day, codex the next, then pi or opencode after that. A week later you want the thing you asked for back then, but you cannot remember which agent you said it to, let alone which project. So you go digging through four different history formats by hand.
+You use claude one day, codex the next, then pi, opencode, Cursor Agent, or Grok after that. A week later you want the thing you asked for back then, but you cannot remember which agent you said it to, let alone which project. So you go digging through six different history formats by hand.
 
-zehn reads all of them at once. It pulls every prompt you have sent to claude, codex, pi, and opencode into a single fuzzy-searchable list. You type a few letters, find the prompt, hit Enter, and it puts you back in that exact session in the agent that owns it.
+zehn reads all of them at once. It pulls every prompt you have sent to claude, codex, pi, opencode, Cursor Agent, and Grok into a single fuzzy-searchable list. You type a few letters, find the prompt, hit Enter, and it puts you back in that exact session in the agent that owns it.
 
 It is one small Zig binary with no runtime dependencies (sqlite3 is optional, and only for opencode). On my machine it reads and parses about 1,300 sessions in roughly 0.2 seconds.
 
@@ -78,7 +80,7 @@ If you do not want it to launch anything, the other modes just print:
 zehn --print     # print the prompt text of whatever you select
 zehn --project   # print  agent <tab> project <tab> text
 zehn --accept-all     # resume supported agents with permission-bypass flags
-zehn --agent claude   # only show one agent: claude, codex, pi, or opencode
+zehn --agent claude   # only show one agent: claude, codex, pi, opencode, cursor, or grok
 zehn --opencode       # shorthand for --agent opencode
 zehn --list      # dump everything, no UI
 zehn update      # update to the latest master build
@@ -96,22 +98,25 @@ the prompt so the read-only history files are never touched.
 
 You can also reuse a prompt somewhere other than its origin session. `^y` copies the
 selected prompt to the clipboard (via `pbcopy`/`wl-copy`/`xclip`/`xsel`). `^o` forks it:
-pick an agent (`1` claude, `2` codex, `3` pi, `4` opencode) and zehn starts a fresh
+pick an agent (`1` claude, `2` codex, `3` pi, `4` opencode, `5` cursor, `6` grok) and zehn starts a fresh
 session there seeded with that prompt — so a prompt you wrote to one agent can be fired
 at another.
 
 ## Where does it look?
 
-| Agent    | History location                               | Resume command            |
-|----------|------------------------------------------------|---------------------------|
-| claude   | `~/.claude/history.jsonl`                       | `claude --resume <id>`    |
-| codex    | `~/.codex/history.jsonl`                        | `codex resume <id>`       |
-| pi       | `~/.pi/agent/sessions/*/*.jsonl`               | `pi --session <id>`       |
-| opencode | `~/.local/share/opencode/opencode.db` (SQLite) | `opencode --session <id>` |
+| Agent    | History location                                                    | Resume command                |
+|----------|---------------------------------------------------------------------|-------------------------------|
+| claude   | `~/.claude/history.jsonl`                                            | `claude --resume <id>`        |
+| codex    | `~/.codex/history.jsonl` and `~/.codex/sessions/**/*.jsonl`          | `codex resume <id>`           |
+| pi       | `~/.pi/agent/sessions/*/*.jsonl`                                    | `pi --session <id>`           |
+| opencode | `~/.local/share/opencode/opencode.db` (SQLite)                      | `opencode --session <id>`     |
+| cursor   | `~/.cursor/projects/*/agent-transcripts/*/*.jsonl`                  | `cursor-agent --resume <id>`  |
+| grok     | `~/.grok/sessions/*/*/chat_history.jsonl` plus sibling `summary.json` | `grok --resume <id>`          |
 
 With `--accept-all`, supported resume commands add the same permission-bypass
 flags Ghostex uses: `codex --yolo`, `claude --dangerously-skip-permissions`,
-and `opencode --dangerously-skip-permissions`. `pi` has no Accept All flag.
+`opencode --dangerously-skip-permissions`, `cursor-agent --yolo`, and
+`grok --permission-mode bypassPermissions`. `pi` has no Accept All flag.
 
 Each agent shows up in its own brand color, so you can tell at a glance whether a result came from claude or codex. Duplicate prompts collapse into one (keeping the most recent), and when two results score the same, the newer one wins.
 
