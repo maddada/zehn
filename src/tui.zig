@@ -88,6 +88,8 @@ fn agentColor(a: scan.Agent) []const u8 {
         .codex => "\x1b[38;2;16;163;127m", // #10A37F OpenAI green
         .opencode => "\x1b[38;2;207;206;205m", // #CFCECD opencode logo gray
         .pi => "\x1b[38;2;136;192;208m", // #88C0D0 pi Nord frost
+        .cursor => "\x1b[38;2;74;144;226m", // Cursor blue
+        .grok => "\x1b[38;2;180;160;255m", // xAI/Grok purple accent
     };
 }
 
@@ -107,7 +109,7 @@ pub const Tui = struct {
     fullscreen_preview: bool = false,
     /// Bit mask of selected agents in the interactive picker. 0 means no
     /// filter, so all agents are shown.
-    agent_filter_mask: u4 = 0,
+    agent_filter_mask: u8 = 0,
     rows: u16 = 24,
     cols: u16 = 80,
     orig: posix.termios = undefined,
@@ -357,7 +359,7 @@ pub const Tui = struct {
         // fork mode replaces the preview with an agent picker
         if (self.forking) {
             b.appendSlice(self.a, "\x1b[1;36mfork prompt into:\x1b[0m  ") catch oom();
-            b.appendSlice(self.a, "\x1b[1m1\x1b[0m claude  \x1b[1m2\x1b[0m codex  \x1b[1m3\x1b[0m pi  \x1b[1m4\x1b[0m opencode") catch oom();
+            b.appendSlice(self.a, "\x1b[1m1\x1b[0m claude  \x1b[1m2\x1b[0m codex  \x1b[1m3\x1b[0m pi  \x1b[1m4\x1b[0m opencode  \x1b[1m5\x1b[0m cursor  \x1b[1m6\x1b[0m grok") catch oom();
             b.appendSlice(self.a, "  \x1b[90m(esc cancels)\x1b[0m\r\n") catch oom();
             try self.flushFrame(w, b);
             return;
@@ -500,6 +502,14 @@ pub const Tui = struct {
                             self.filter_sel = 3;
                             self.toggleFilterSelection();
                         },
+                        '5' => {
+                            self.filter_sel = 4;
+                            self.toggleFilterSelection();
+                        },
+                        '6' => {
+                            self.filter_sel = 5;
+                            self.toggleFilterSelection();
+                        },
                         14 => self.moveFilterSelection(1), // ctrl-n
                         16 => self.moveFilterSelection(-1), // ctrl-p
                         else => {},
@@ -518,6 +528,8 @@ pub const Tui = struct {
                             '2' => .codex,
                             '3' => .pi,
                             '4' => .opencode,
+                            '5' => .cursor,
+                            '6' => .grok,
                             else => null,
                         };
                         if (agent) |ag| return .{
@@ -793,8 +805,7 @@ pub const Tui = struct {
         if (self.agent_filter_mask == 0) return;
         b.appendSlice(self.a, "  agents:") catch oom();
         var first = true;
-        const agents = [_]scan.Agent{ .claude, .codex, .pi, .opencode };
-        for (agents) |agent| {
+        for (scan.Agent.all()) |agent| {
             if ((self.agent_filter_mask & agentBit(agent)) == 0) continue;
             if (!first) b.append(self.a, ',') catch oom();
             b.appendSlice(self.a, agent.label()) catch oom();
@@ -806,12 +817,14 @@ pub const Tui = struct {
         self.appendAgentFilterStatusPlain(b);
     }
 
-    fn agentBit(agent: scan.Agent) u4 {
+    fn agentBit(agent: scan.Agent) u8 {
         return switch (agent) {
             .claude => 1 << 0,
             .codex => 1 << 1,
             .pi => 1 << 2,
             .opencode => 1 << 3,
+            .cursor => 1 << 4,
+            .grok => 1 << 5,
         };
     }
 
@@ -826,21 +839,20 @@ pub const Tui = struct {
 
     fn moveFilterSelection(self: *Tui, delta: isize) void {
         if (delta < 0) {
-            self.filter_sel = if (self.filter_sel == 0) 3 else self.filter_sel - 1;
+            self.filter_sel = if (self.filter_sel == 0) scan.Agent.all().len - 1 else self.filter_sel - 1;
         } else {
-            self.filter_sel = (self.filter_sel + 1) % 4;
+            self.filter_sel = (self.filter_sel + 1) % scan.Agent.all().len;
         }
     }
 
     fn toggleFilterSelection(self: *Tui) void {
-        const agents = [_]scan.Agent{ .claude, .codex, .pi, .opencode };
-        self.agent_filter_mask ^= agentBit(agents[self.filter_sel]);
+        self.agent_filter_mask ^= agentBit(scan.Agent.all()[self.filter_sel]);
         self.recompute();
     }
 
     fn writeAgentFilterPicker(self: *Tui, b: *std.ArrayList(u8), max_rows: usize) void {
         b.appendSlice(self.a, "\r\n") catch oom();
-        const agents = [_]scan.Agent{ .claude, .codex, .pi, .opencode };
+        const agents = scan.Agent.all();
         const rows = @min(max_rows, agents.len);
         for (agents[0..rows], 0..) |agent, idx| {
             const focused = idx == self.filter_sel;
@@ -1293,29 +1305,29 @@ test "interactive agent filter picker filters hits" {
     defer tui.hits.deinit(testing.allocator);
     tui.recompute();
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
-    try testing.expectEqual(@as(u4, 0), tui.agent_filter_mask);
+    try testing.expectEqual(@as(u8, 0), tui.agent_filter_mask);
 
     tui.openAgentFilterPicker();
     try testing.expectEqual(@as(usize, 0), tui.filter_sel);
     tui.toggleFilterSelection();
-    try testing.expectEqual(@as(u4, 1), tui.agent_filter_mask);
+    try testing.expectEqual(@as(u8, 1), tui.agent_filter_mask);
     try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
     try testing.expectEqual(scan.Agent.claude, records[tui.hits.items[0].idx].agent);
 
     tui.filter_sel = 3;
     tui.toggleFilterSelection();
-    try testing.expectEqual(@as(u4, 9), tui.agent_filter_mask);
+    try testing.expectEqual(@as(u8, 9), tui.agent_filter_mask);
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
 
     tui.filter_sel = 0;
     tui.toggleFilterSelection();
-    try testing.expectEqual(@as(u4, 8), tui.agent_filter_mask);
+    try testing.expectEqual(@as(u8, 8), tui.agent_filter_mask);
     try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
     try testing.expectEqual(scan.Agent.opencode, records[tui.hits.items[0].idx].agent);
 
     tui.filter_sel = 3;
     tui.toggleFilterSelection();
-    try testing.expectEqual(@as(u4, 0), tui.agent_filter_mask);
+    try testing.expectEqual(@as(u8, 0), tui.agent_filter_mask);
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
 }
 
