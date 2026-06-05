@@ -13,6 +13,8 @@ pub const Agent = enum {
     codex,
     pi,
     opencode,
+    cursor,
+    grok,
 
     pub fn label(self: Agent) []const u8 {
         return switch (self) {
@@ -20,7 +22,13 @@ pub const Agent = enum {
             .codex => "codex",
             .pi => "pi",
             .opencode => "opencode",
+            .cursor => "cursor",
+            .grok => "grok",
         };
+    }
+
+    pub fn all() []const Agent {
+        return &.{ .claude, .codex, .pi, .opencode, .cursor, .grok };
     }
 };
 
@@ -55,6 +63,10 @@ pub const Record = struct {
 // CDXC:AgentHistorySearch 2026-06-04-23:31:
 // Codex session files can total multiple gigabytes while zehn only needs extracted user prompts and session metadata at launch.
 // Store a disposable derived cache under ~/.ghostex/zehn and invalidate each cached session by the source file's size and modified time so unchanged sessions do not get reparsed on every startup.
+// CDXC:AgentHistorySearch 2026-06-05-00:14:
+// Cursor Agent and Grok should participate in the same cross-agent history picker and resume flow.
+// Cursor prompt text is read from local Cursor project agent-transcript JSONL files; matching ACP metadata is optional and only supplies cwd when present.
+// Grok prompt text is read from ~/.grok/sessions/<encoded-cwd>/<session-id>/chat_history.jsonl while summary.json supplies session id, cwd, and model metadata.
 const codex_cache_version = 1;
 
 const SourceStamp = struct {
@@ -121,6 +133,8 @@ pub const Scanner = struct {
         self.scanCodex();
         self.scanPi();
         self.scanOpencode();
+        self.scanCursor();
+        self.scanGrok();
         self.dedup();
     }
 
@@ -464,6 +478,112 @@ pub const Scanner = struct {
         self.parsePiSession(data);
     }
 
+    fn scanCursor(self: *Scanner) void {
+        const base = self.path("/.cursor/projects");
+        var root = Io.Dir.cwd().openDir(self.io, base, .{ .iterate = true }) catch return;
+        defer root.close(self.io);
+        var projects = root.iterate();
+        while (projects.next(self.io) catch null) |pe| {
+            if (pe.kind != .directory) continue;
+            var project_dir = root.openDir(self.io, pe.name, .{ .iterate = true }) catch continue;
+            defer project_dir.close(self.io);
+            var transcripts = project_dir.openDir(self.io, "agent-transcripts", .{ .iterate = true }) catch continue;
+            defer transcripts.close(self.io);
+            var sessions = transcripts.iterate();
+            while (sessions.next(self.io) catch null) |se| {
+                if (se.kind != .directory) continue;
+                const file_name = std.fmt.allocPrint(self.a, "{s}.jsonl", .{se.name}) catch continue;
+                var session_dir = transcripts.openDir(self.io, se.name, .{ .iterate = true }) catch continue;
+                defer session_dir.close(self.io);
+                const stat = session_dir.statFile(self.io, file_name, .{}) catch continue;
+                const data = session_dir.readFileAlloc(self.io, file_name, self.a, .limited(64 * 1024 * 1024)) catch continue;
+                const project = self.cursorProjectForSession(se.name) orelse "";
+                self.parseCursorTranscript(data, project, se.name, timestampSeconds(stat.mtime));
+            }
+        }
+    }
+
+    fn cursorProjectForSession(self: *Scanner, session_id: []const u8) ?[]const u8 {
+        const meta_path = std.fmt.allocPrint(self.a, "{s}/.cursor/acp-sessions/{s}/meta.json", .{ self.home, session_id }) catch return null;
+        const data = self.readAll(meta_path) orelse return null;
+        const v = json.parseFromSliceLeaky(json.Value, self.a, data, .{}) catch return null;
+        return stringField(v, "cwd");
+    }
+
+    /// Parse Cursor Agent transcript JSONL from ~/.cursor/projects/*/agent-transcripts.
+    pub fn parseCursorTranscript(self: *Scanner, data: []const u8, project: []const u8, session_id: []const u8, ts: i64) void {
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            const v = self.parseLine(line) orelse continue;
+            if (v != .object) continue;
+            const role = stringField(v, "role") orelse continue;
+            if (!std.mem.eql(u8, role, "user")) continue;
+            const msg = fieldValue(v, "message") orelse continue;
+            if (msg != .object) continue;
+            const content = fieldValue(msg, "content") orelse continue;
+            const text = self.contentText(content) orelse continue;
+            if (text.len == 0) continue;
+            self.add(.{ .agent = .cursor, .text = text, .project = project, .session = session_id, .ts = ts });
+        }
+    }
+
+    fn scanGrok(self: *Scanner) void {
+        const base = self.path("/.grok/sessions");
+        var root = Io.Dir.cwd().openDir(self.io, base, .{ .iterate = true }) catch return;
+        defer root.close(self.io);
+        var projects = root.iterate();
+        while (projects.next(self.io) catch null) |pe| {
+            if (pe.kind != .directory) continue;
+            var project_dir = root.openDir(self.io, pe.name, .{ .iterate = true }) catch continue;
+            defer project_dir.close(self.io);
+            var sessions = project_dir.iterate();
+            while (sessions.next(self.io) catch null) |se| {
+                if (se.kind != .directory) continue;
+                var session_dir = project_dir.openDir(self.io, se.name, .{ .iterate = true }) catch continue;
+                defer session_dir.close(self.io);
+                const summary_data = session_dir.readFileAlloc(self.io, "summary.json", self.a, .limited(8 * 1024 * 1024)) catch continue;
+                var info = self.parseGrokSummary(summary_data, se.name);
+                const stat = session_dir.statFile(self.io, "chat_history.jsonl", .{}) catch continue;
+                const data = session_dir.readFileAlloc(self.io, "chat_history.jsonl", self.a, .limited(64 * 1024 * 1024)) catch continue;
+                if (info.ts == 0) info.ts = timestampSeconds(stat.mtime);
+                self.parseGrokChatHistory(data, info);
+            }
+        }
+    }
+
+    const GrokInfo = struct {
+        session: []const u8,
+        project: []const u8 = "",
+        model: []const u8 = "",
+        ts: i64 = 0,
+    };
+
+    fn parseGrokSummary(self: *Scanner, data: []const u8, fallback_session: []const u8) GrokInfo {
+        const v = json.parseFromSliceLeaky(json.Value, self.a, data, .{}) catch return .{ .session = fallback_session };
+        var info = GrokInfo{
+            .session = stringField(fieldValue(v, "info") orelse .{ .object = .empty }, "id") orelse stringField(v, "id") orelse fallback_session,
+            .project = stringField(fieldValue(v, "info") orelse .{ .object = .empty }, "cwd") orelse stringField(v, "git_root_dir") orelse "",
+            .model = stringField(v, "current_model_id") orelse "",
+        };
+        if (stringField(v, "updated_at")) |updated| info.ts = parseIso8601Seconds(updated);
+        return info;
+    }
+
+    /// Parse Grok chat history JSONL from ~/.grok/sessions/*/*/chat_history.jsonl.
+    pub fn parseGrokChatHistory(self: *Scanner, data: []const u8, info: GrokInfo) void {
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            const v = self.parseLine(line) orelse continue;
+            if (v != .object) continue;
+            const typ = stringField(v, "type") orelse continue;
+            if (!std.mem.eql(u8, typ, "user")) continue;
+            const content = fieldValue(v, "content") orelse continue;
+            const text = self.contentText(content) orelse continue;
+            if (text.len == 0) continue;
+            self.add(.{ .agent = .grok, .text = text, .project = info.project, .session = info.session, .ts = info.ts, .meta = .{ .provider = "xai", .model = info.model } });
+        }
+    }
+
     fn intVal(v: json.Value) u64 {
         return switch (v) {
             .integer => |n| if (n > 0) @intCast(n) else 0,
@@ -489,6 +609,34 @@ pub const Scanner = struct {
         const x = fieldValue(v, name) orelse return null;
         if (x != .string) return null;
         return x.string;
+    }
+
+    fn timestampSeconds(ts: Io.Timestamp) i64 {
+        return @intCast(@divTrunc(ts.nanoseconds, 1_000_000_000));
+    }
+
+    fn parseIso8601Seconds(s: []const u8) i64 {
+        if (s.len < 19) return 0;
+        const year = std.fmt.parseInt(i64, s[0..4], 10) catch return 0;
+        const month = std.fmt.parseInt(u8, s[5..7], 10) catch return 0;
+        const day = std.fmt.parseInt(u8, s[8..10], 10) catch return 0;
+        const hour = std.fmt.parseInt(u8, s[11..13], 10) catch return 0;
+        const minute = std.fmt.parseInt(u8, s[14..16], 10) catch return 0;
+        const second = std.fmt.parseInt(u8, s[17..19], 10) catch return 0;
+        const days = daysFromCivil(year, month, day);
+        return days * 86_400 + @as(i64, hour) * 3_600 + @as(i64, minute) * 60 + @as(i64, second);
+    }
+
+    fn daysFromCivil(year: i64, month: u8, day: u8) i64 {
+        var y = year;
+        const m: i64 = month;
+        y -= @intFromBool(m <= 2);
+        const era = @divFloor(y, 400);
+        const yoe = y - era * 400;
+        const mp = m + if (m > 2) @as(i64, -3) else 9;
+        const doy = @divTrunc(153 * mp + 2, 5) + @as(i64, day) - 1;
+        const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy;
+        return era * 146097 + doe - 719468;
     }
 
     fn applyMetaToSessionRecords(self: *Scanner, start: usize, meta: Meta) void {
@@ -792,6 +940,42 @@ test "parse opencode query output: user text parts only" {
     try testing.expectEqualStrings("/oc/proj", sc.records.items[0].project);
     try testing.expectEqualStrings("oc1", sc.records.items[0].session);
     try testing.expectEqual(Agent.opencode, sc.records.items[0].agent);
+}
+
+test "parse cursor transcript: user message content only" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    const data =
+        \\{"role":"user","message":{"content":[{"type":"text","text":"cursor prompt"},{"type":"tool_use","name":"ignored"}]}}
+        \\{"role":"assistant","message":{"content":[{"type":"text","text":"assistant reply"}]}}
+    ;
+    sc.parseCursorTranscript(data, "/work/cursor", "cursor-session", 1770000000);
+    try testing.expectEqual(@as(usize, 1), sc.records.items.len);
+    try testing.expectEqual(Agent.cursor, sc.records.items[0].agent);
+    try testing.expectEqualStrings("cursor prompt", sc.records.items[0].text);
+    try testing.expectEqualStrings("/work/cursor", sc.records.items[0].project);
+    try testing.expectEqualStrings("cursor-session", sc.records.items[0].session);
+    try testing.expectEqual(@as(i64, 1770000000), sc.records.items[0].ts);
+}
+
+test "parse grok chat history: user content with summary metadata" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    const data =
+        \\{"type":"system","content":"ignored"}
+        \\{"type":"user","content":[{"type":"text","text":"grok prompt"}]}
+        \\{"type":"assistant","content":"assistant reply"}
+    ;
+    sc.parseGrokChatHistory(data, .{ .session = "grok-session", .project = "/work/grok", .model = "grok-test", .ts = 1770000001 });
+    try testing.expectEqual(@as(usize, 1), sc.records.items.len);
+    try testing.expectEqual(Agent.grok, sc.records.items[0].agent);
+    try testing.expectEqualStrings("grok prompt", sc.records.items[0].text);
+    try testing.expectEqualStrings("/work/grok", sc.records.items[0].project);
+    try testing.expectEqualStrings("grok-session", sc.records.items[0].session);
+    try testing.expectEqualStrings("grok-test", sc.records.items[0].meta.model);
+    try testing.expectEqual(@as(i64, 1770000001), sc.records.items[0].ts);
 }
 
 test "dedup keeps most recent identical prompt" {
