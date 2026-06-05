@@ -27,6 +27,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(a);
     var print_project = false;
     var print_only = false;
+    var list_only = false;
     // CDXC:AgentHistorySearch 2026-06-04-23:31:
     // Ghostex users can resume agent history from zehn while their app-wide Accept All policy is enabled. Keep standalone zehn opt-in with an explicit CLI flag so the search tool does not depend on gxserver state.
     var accept_all_resume = false;
@@ -42,14 +43,13 @@ pub fn main(init: std.process.Init) !void {
             try selfUpdate(init, w);
             return;
         } else if (std.mem.eql(u8, arg, "--list")) {
-            try listMode(a, io, home, w);
-            return;
+            list_only = true;
         } else if (std.mem.eql(u8, arg, "--project")) {
             print_project = true;
             print_only = true;
         } else if (std.mem.eql(u8, arg, "--agent")) {
             arg_i += 1;
-            if (arg_i >= args.len) return usageError(w, "--agent needs one of: claude, codex, pi, opencode");
+            if (arg_i >= args.len) return usageError(w, "--agent needs one of: claude, codex, pi, opencode, cursor, grok");
             agent_filter = parseAgent(args[arg_i]) orelse return usageError(w, "unknown agent");
         } else if (std.mem.startsWith(u8, arg, "--agent=")) {
             agent_filter = parseAgent(arg[8..]) orelse return usageError(w, "unknown agent");
@@ -66,13 +66,14 @@ pub fn main(init: std.process.Init) !void {
                 \\zehn (ذهن, "the mind") — fuzzy finder & resumer for AI agent sessions
                 \\
                 \\Sources: claude (~/.claude), codex (~/.codex), pi (~/.pi),
-                \\         opencode (~/.local/share/opencode/opencode.db, needs sqlite3)
+                \\         opencode (~/.local/share/opencode/opencode.db, needs sqlite3),
+                \\         cursor (~/.cursor/projects), grok (~/.grok/sessions)
                 \\
                 \\Usage:
                 \\  zehn            find a prompt, then RESUME that session in its agent
                 \\  zehn --print    just print the selected prompt text (no resume)
                 \\  zehn --project  print agent<TAB>project<TAB>text (implies --print)
-                \\  zehn --agent claude   show only one agent (claude/codex/pi/opencode)
+                \\  zehn --agent claude   show only one agent (claude/codex/pi/opencode/cursor/grok)
                 \\  zehn --claude         shorthand for --agent claude
                 \\  zehn --accept-all     resume with supported permission-bypass flags
                 \\  zehn update     update zehn from the latest master build
@@ -82,6 +83,8 @@ pub fn main(init: std.process.Init) !void {
                 \\         codex [--yolo] resume <id>
                 \\         pi --session <id>
                 \\         opencode [--dangerously-skip-permissions] --session <id>
+                \\         cursor-agent [--yolo] --resume <id>
+                \\         grok [--permission-mode bypassPermissions] --resume <id>
                 \\(run from the session's project directory)
                 \\
                 \\Keys: type to filter · ↑/↓ or ^p/^n move · Enter resume
@@ -94,6 +97,11 @@ pub fn main(init: std.process.Init) !void {
             try w.flush();
             return;
         }
+    }
+
+    if (list_only) {
+        try listMode(a, io, home, w, agent_filter);
+        return;
     }
 
     try checkForUpdate(init, w);
@@ -149,12 +157,12 @@ pub fn main(init: std.process.Init) !void {
 
 fn usageError(w: *Io.Writer, msg: []const u8) !void {
     try w.print("zehn: {s}\n", .{msg});
-    try w.writeAll("usage: zehn [--agent claude|codex|pi|opencode] [--accept-all|--no-accept-all] [--print|--project|--list]\n");
+    try w.writeAll("usage: zehn [--agent claude|codex|pi|opencode|cursor|grok] [--accept-all|--no-accept-all] [--print|--project|--list]\n");
     try w.flush();
 }
 
 fn parseAgent(name: []const u8) ?scan.Agent {
-    inline for (.{ scan.Agent.claude, scan.Agent.codex, scan.Agent.pi, scan.Agent.opencode }) |agent| {
+    for (scan.Agent.all()) |agent| {
         if (std.mem.eql(u8, name, agent.label())) return agent;
     }
     return null;
@@ -179,8 +187,10 @@ fn filterRecordsByAgent(records: *std.ArrayList(scan.Record), agent: scan.Agent)
 test "agent filter parsing accepts long and shorthand forms" {
     try std.testing.expectEqual(scan.Agent.claude, parseAgent("claude").?);
     try std.testing.expectEqual(scan.Agent.opencode, parseAgent("opencode").?);
+    try std.testing.expectEqual(scan.Agent.cursor, parseAgent("cursor").?);
+    try std.testing.expectEqual(scan.Agent.grok, parseAgent("grok").?);
     try std.testing.expectEqual(scan.Agent.codex, parseAgentFlag("--codex").?);
-    try std.testing.expect(parseAgent("cursor") == null);
+    try std.testing.expect(parseAgent("antigravity") == null);
 }
 
 test "agent filter keeps only requested records" {
@@ -343,7 +353,7 @@ fn forkSession(init: std.process.Init, io: Io, w: *Io.Writer, rec: scan.Record, 
 }
 
 const ResumeArgv = struct {
-    items: [4][]const u8 = undefined,
+    items: [5][]const u8 = undefined,
     len: usize = 0,
 
     fn slice(self: *const ResumeArgv) []const []const u8 {
@@ -354,17 +364,21 @@ const ResumeArgv = struct {
 fn resumeArgv(agent: scan.Agent, session: []const u8, accept_all: bool) ResumeArgv {
     if (accept_all) {
         return switch (agent) {
-            .claude => .{ .items = .{ "claude", "--dangerously-skip-permissions", "--resume", session }, .len = 4 },
-            .codex => .{ .items = .{ "codex", "--yolo", "resume", session }, .len = 4 },
-            .pi => .{ .items = .{ "pi", "--session", session, undefined }, .len = 3 },
-            .opencode => .{ .items = .{ "opencode", "--dangerously-skip-permissions", "--session", session }, .len = 4 },
+            .claude => .{ .items = .{ "claude", "--dangerously-skip-permissions", "--resume", session, undefined }, .len = 4 },
+            .codex => .{ .items = .{ "codex", "--yolo", "resume", session, undefined }, .len = 4 },
+            .pi => .{ .items = .{ "pi", "--session", session, undefined, undefined }, .len = 3 },
+            .opencode => .{ .items = .{ "opencode", "--dangerously-skip-permissions", "--session", session, undefined }, .len = 4 },
+            .cursor => .{ .items = .{ "cursor-agent", "--yolo", "--resume", session, undefined }, .len = 4 },
+            .grok => .{ .items = .{ "grok", "--permission-mode", "bypassPermissions", "--resume", session }, .len = 5 },
         };
     }
     return switch (agent) {
-        .claude => .{ .items = .{ "claude", "--resume", session, undefined }, .len = 3 },
-        .codex => .{ .items = .{ "codex", "resume", session, undefined }, .len = 3 },
-        .pi => .{ .items = .{ "pi", "--session", session, undefined }, .len = 3 },
-        .opencode => .{ .items = .{ "opencode", "--session", session, undefined }, .len = 3 },
+        .claude => .{ .items = .{ "claude", "--resume", session, undefined, undefined }, .len = 3 },
+        .codex => .{ .items = .{ "codex", "resume", session, undefined, undefined }, .len = 3 },
+        .pi => .{ .items = .{ "pi", "--session", session, undefined, undefined }, .len = 3 },
+        .opencode => .{ .items = .{ "opencode", "--session", session, undefined, undefined }, .len = 3 },
+        .cursor => .{ .items = .{ "cursor-agent", "--resume", session, undefined, undefined }, .len = 3 },
+        .grok => .{ .items = .{ "grok", "--resume", session, undefined, undefined }, .len = 3 },
     };
 }
 
@@ -458,6 +472,25 @@ test "resume argv optionally applies Ghostex Accept All flags" {
         try std.testing.expectEqualStrings("--session", argv[1]);
         try std.testing.expectEqualStrings("pi-session", argv[2]);
     }
+    {
+        const argv_buf = resumeArgv(.cursor, "cursor-session", true);
+        const argv = argv_buf.slice();
+        try std.testing.expectEqual(@as(usize, 4), argv.len);
+        try std.testing.expectEqualStrings("cursor-agent", argv[0]);
+        try std.testing.expectEqualStrings("--yolo", argv[1]);
+        try std.testing.expectEqualStrings("--resume", argv[2]);
+        try std.testing.expectEqualStrings("cursor-session", argv[3]);
+    }
+    {
+        const argv_buf = resumeArgv(.grok, "grok-session", true);
+        const argv = argv_buf.slice();
+        try std.testing.expectEqual(@as(usize, 5), argv.len);
+        try std.testing.expectEqualStrings("grok", argv[0]);
+        try std.testing.expectEqualStrings("--permission-mode", argv[1]);
+        try std.testing.expectEqualStrings("bypassPermissions", argv[2]);
+        try std.testing.expectEqualStrings("--resume", argv[3]);
+        try std.testing.expectEqualStrings("grok-session", argv[4]);
+    }
 }
 
 fn writeSanitized(w: *Io.Writer, text: []const u8) !void {
@@ -466,9 +499,10 @@ fn writeSanitized(w: *Io.Writer, text: []const u8) !void {
     }
 }
 
-fn listMode(a: std.mem.Allocator, io: Io, home: []const u8, w: *Io.Writer) !void {
+fn listMode(a: std.mem.Allocator, io: Io, home: []const u8, w: *Io.Writer, agent_filter: ?scan.Agent) !void {
     var sc = scan.Scanner.init(a, io, home);
     sc.scanAll();
+    if (agent_filter) |agent| filterRecordsByAgent(&sc.records, agent);
     for (sc.records.items) |rec| {
         try w.print("{s}\t{s}\t", .{ rec.agent.label(), rec.project });
         try writeSanitized(w, rec.text);

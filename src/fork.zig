@@ -33,6 +33,8 @@ pub fn freshSessionArgv(agent: scan.Agent, prompt: []const u8) [2][]const u8 {
         .codex => .{ "codex", prompt },
         .pi => .{ "pi", prompt },
         .opencode => .{ "opencode", prompt },
+        .cursor => .{ "cursor-agent", prompt },
+        .grok => .{ "grok", prompt },
     };
 }
 
@@ -57,6 +59,8 @@ test "freshSessionArgv carries the prompt as a single arg per agent" {
         .{ scan.Agent.codex, "codex" },
         .{ scan.Agent.pi, "pi" },
         .{ scan.Agent.opencode, "opencode" },
+        .{ scan.Agent.cursor, "cursor-agent" },
+        .{ scan.Agent.grok, "grok" },
     }) |c| {
         const argv = freshSessionArgv(c[0], "make it faster");
         try testing.expectEqualStrings(c[1], argv[0]);
