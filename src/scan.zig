@@ -71,8 +71,13 @@ pub const Record = struct {
 // CDXC:AgentHistorySearch 2026-06-07-08:27:
 // Zehn result rows and day grouping need a dependable last-active time for every session. Preserve `Record.ts` in the Codex derived cache and fall back to session file mtimes when an agent history format does not expose a timestamp per prompt.
 // CDXC:AgentHistorySearch 2026-06-07-08:39:
-// Result rows now show the source-provided session title on the first line and the matched prompt text on the second. Keep titles as explicit record metadata and preserve them through derived caches instead of deriving titles from private prompt content.
-const codex_cache_version = 3;
+// Result rows now show the matched prompt first and the undecorated session title/id directly under the prompt on the second line. Keep titles as explicit record metadata and preserve them through derived caches instead of deriving titles from private prompt content; Cursor must still expose its session id when ACP metadata does not provide a title.
+// CDXC:AgentHistorySearch 2026-06-07-11:55:
+// Codex rollout files often omit titles while `~/.codex/session_index.jsonl` stores the canonical `thread_name` by session id. Load that index before Codex records and overlay its title onto cached and freshly parsed records so Zehn does not fall back to ids when Codex has a real title.
+// CDXC:AgentHistorySearch 2026-06-07-14:59:
+// Claude history rows should show saved session names instead of raw ids when Claude has already indexed a title. Load `sessions-index.json` metadata from normal and profile project stores before parsing history, and sanitize display titles at ingestion so corrupt or control-bearing metadata cannot render mojibake in the result list.
+// Cursor transcript directory names are iterator scratch slices, so copy them before storing as session ids. Otherwise later iteration can corrupt the id shown under Cursor prompts and the resume target attached to the row.
+const codex_cache_version = 4;
 
 const SourceStamp = struct {
     size_text: []const u8,
@@ -84,11 +89,20 @@ pub const Scanner = struct {
     io: Io,
     home: []const u8,
     records: std.ArrayList(Record),
+    claude_titles: std.StringHashMap([]const u8),
+    codex_titles: std.StringHashMap([]const u8),
     /// Set when an opencode DB exists but the `sqlite3` CLI is unavailable.
     sqlite_missing: bool = false,
 
     pub fn init(a: std.mem.Allocator, io: Io, home: []const u8) Scanner {
-        return .{ .a = a, .io = io, .home = home, .records = .empty };
+        return .{
+            .a = a,
+            .io = io,
+            .home = home,
+            .records = .empty,
+            .claude_titles = std.StringHashMap([]const u8).init(a),
+            .codex_titles = std.StringHashMap([]const u8).init(a),
+        };
     }
 
     fn path(self: *Scanner, comptime suffix: []const u8) []const u8 {
@@ -162,9 +176,74 @@ pub const Scanner = struct {
     }
 
     fn scanClaude(self: *Scanner) void {
+        self.loadClaudeSessionTitles();
         const p = self.path("/.claude/history.jsonl");
         const data = self.readAll(p) orelse return;
         self.parseClaudeHistory(data);
+    }
+
+    fn loadClaudeSessionTitles(self: *Scanner) void {
+        self.loadClaudeProjectSessionIndexes(self.path("/.claude/projects"));
+        self.loadClaudeProjectSessionIndexes(self.path("/.claude/projects2"));
+        self.loadClaudeProfileSessionIndexes();
+    }
+
+    fn loadClaudeProjectSessionIndexes(self: *Scanner, base: []const u8) void {
+        var root = Io.Dir.cwd().openDir(self.io, base, .{ .iterate = true }) catch return;
+        defer root.close(self.io);
+        var projects = root.iterate();
+        while (projects.next(self.io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            var project_dir = root.openDir(self.io, entry.name, .{ .iterate = true }) catch continue;
+            defer project_dir.close(self.io);
+            const data = project_dir.readFileAlloc(self.io, "sessions-index.json", self.a, .limited(32 * 1024 * 1024)) catch continue;
+            self.parseClaudeSessionsIndex(data);
+        }
+    }
+
+    fn loadClaudeProfileSessionIndexes(self: *Scanner) void {
+        const base = self.path("/.claude-profiles");
+        var root = Io.Dir.cwd().openDir(self.io, base, .{ .iterate = true }) catch return;
+        defer root.close(self.io);
+        var profiles = root.iterate();
+        while (profiles.next(self.io) catch null) |profile| {
+            if (profile.kind != .directory) continue;
+            var profile_dir = root.openDir(self.io, profile.name, .{ .iterate = true }) catch continue;
+            defer profile_dir.close(self.io);
+            var projects_dir = profile_dir.openDir(self.io, "projects", .{ .iterate = true }) catch continue;
+            defer projects_dir.close(self.io);
+            var projects = projects_dir.iterate();
+            while (projects.next(self.io) catch null) |project| {
+                if (project.kind != .directory) continue;
+                var project_dir = projects_dir.openDir(self.io, project.name, .{ .iterate = true }) catch continue;
+                defer project_dir.close(self.io);
+                const data = project_dir.readFileAlloc(self.io, "sessions-index.json", self.a, .limited(32 * 1024 * 1024)) catch continue;
+                self.parseClaudeSessionsIndex(data);
+            }
+        }
+    }
+
+    fn parseClaudeSessionsIndex(self: *Scanner, data: []const u8) void {
+        const v = json.parseFromSliceLeaky(json.Value, self.a, data, .{}) catch return;
+        const entries = fieldValue(v, "entries") orelse return;
+        if (entries != .array) return;
+        for (entries.array.items) |entry| {
+            const session_id = stringField(entry, "sessionId") orelse stringField(entry, "id") orelse continue;
+            const title = titleFromFields(entry, &.{ "customTitle", "agentName", "summary", "slug", "title" }) orelse continue;
+            self.putClaudeTitleIfAbsent(session_id, title);
+        }
+    }
+
+    fn putClaudeTitleIfAbsent(self: *Scanner, session_id: []const u8, title: []const u8) void {
+        if (cleanTitle(session_id) == null) return;
+        const safe_title = cleanTitle(title) orelse return;
+        if (self.claude_titles.contains(session_id)) return;
+        self.claude_titles.put(session_id, safe_title) catch oom();
+    }
+
+    fn claudeTitleForSession(self: *Scanner, session_id: []const u8) ?[]const u8 {
+        if (session_id.len == 0) return null;
+        return self.claude_titles.get(session_id);
     }
 
     /// Parse `~/.claude/history.jsonl` content.
@@ -186,7 +265,7 @@ pub const Scanner = struct {
             // file buffer) and persist for the program's lifetime.
             self.add(.{
                 .agent = .claude,
-                .title = titleFromObject(v) orelse "",
+                .title = titleFromObject(v) orelse self.claudeTitleForSession(sess) orelse "",
                 .text = disp.string,
                 .project = proj,
                 .session = sess,
@@ -196,9 +275,28 @@ pub const Scanner = struct {
     }
 
     fn scanCodex(self: *Scanner) void {
+        self.loadCodexSessionIndexTitles();
         const p = self.path("/.codex/history.jsonl");
         if (self.readAll(p)) |data| self.parseCodexHistory(data);
         self.scanCodexSessions();
+    }
+
+    fn loadCodexSessionIndexTitles(self: *Scanner) void {
+        const p = self.path("/.codex/session_index.jsonl");
+        const data = self.readAll(p) orelse return;
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            const v = self.parseLine(line) orelse continue;
+            const session_id = stringField(v, "id") orelse continue;
+            if (session_id.len == 0) continue;
+            const title = titleFromObject(v) orelse continue;
+            self.codex_titles.put(session_id, title) catch oom();
+        }
+    }
+
+    fn codexTitleForSession(self: *Scanner, session_id: []const u8) ?[]const u8 {
+        if (session_id.len == 0) return null;
+        return self.codex_titles.get(session_id);
     }
 
     fn scanCodexSessions(self: *Scanner) void {
@@ -268,7 +366,7 @@ pub const Scanner = struct {
         var h = std.hash.Wyhash.init(0);
         h.update(source_path);
         const id = h.final();
-        return std.fmt.allocPrint(self.a, "{s}/.ghostex/zehn/codex-sessions-v3/{x:0>16}.jsonl", .{ self.home, id }) catch null;
+        return std.fmt.allocPrint(self.a, "{s}/.ghostex/zehn/codex-sessions-v4/{x:0>16}.jsonl", .{ self.home, id }) catch null;
     }
 
     fn saveCodexCache(self: *Scanner, cache_path: []const u8, source_path: []const u8, stamp: SourceStamp, records: []const Record) void {
@@ -334,12 +432,13 @@ pub const Scanner = struct {
             if (!std.mem.eql(u8, kind, "record")) continue;
             const text = stringField(v, "text") orelse continue;
             if (text.len == 0) continue;
+            const session = stringField(v, "session") orelse "";
             self.add(.{
                 .agent = .codex,
-                .title = stringField(v, "title") orelse "",
+                .title = self.codexTitleForSession(session) orelse stringField(v, "title") orelse "",
                 .text = text,
                 .project = stringField(v, "project") orelse "",
-                .session = stringField(v, "session") orelse "",
+                .session = session,
                 .ts = timestampValue(fieldValue(v, "ts") orelse .{ .integer = 0 }),
                 .meta = .{
                     .provider = stringField(v, "provider") orelse "",
@@ -390,7 +489,7 @@ pub const Scanner = struct {
             };
             self.add(.{
                 .agent = .codex,
-                .title = titleFromObject(v) orelse "",
+                .title = self.codexTitleForSession(sess) orelse titleFromObject(v) orelse "",
                 .text = txt.string,
                 .project = "",
                 .session = sess,
@@ -425,11 +524,15 @@ pub const Scanner = struct {
                 };
                 if (payload.object.get("id")) |x| if (x == .string) {
                     session_id = x.string;
+                    if (self.codexTitleForSession(session_id)) |title| {
+                        session_title = title;
+                        self.applyTitleToSessionRecords(record_start, session_title);
+                    }
                 };
-                if (titleFromObject(payload)) |title| {
+                if (session_title.len == 0) if (titleFromObject(payload)) |title| {
                     session_title = title;
                     self.applyTitleToSessionRecords(record_start, session_title);
-                }
+                };
                 if (payload.object.get("model_provider")) |x| if (x == .string) {
                     meta.provider = x.string;
                 };
@@ -514,13 +617,14 @@ pub const Scanner = struct {
             var sessions = transcripts.iterate();
             while (sessions.next(self.io) catch null) |se| {
                 if (se.kind != .directory) continue;
-                const file_name = std.fmt.allocPrint(self.a, "{s}.jsonl", .{se.name}) catch continue;
-                var session_dir = transcripts.openDir(self.io, se.name, .{ .iterate = true }) catch continue;
+                const session_id = self.a.dupe(u8, se.name) catch oom();
+                const file_name = std.fmt.allocPrint(self.a, "{s}.jsonl", .{session_id}) catch continue;
+                var session_dir = transcripts.openDir(self.io, session_id, .{ .iterate = true }) catch continue;
                 defer session_dir.close(self.io);
                 const stat = session_dir.statFile(self.io, file_name, .{}) catch continue;
                 const data = session_dir.readFileAlloc(self.io, file_name, self.a, .limited(64 * 1024 * 1024)) catch continue;
-                const info = self.cursorInfoForSession(se.name);
-                self.parseCursorTranscript(data, info.project, info.title, se.name, timestampSeconds(stat.mtime));
+                const info = self.cursorInfoForSession(session_id);
+                self.parseCursorTranscript(data, info.project, info.title, session_id, timestampSeconds(stat.mtime));
             }
         }
     }
@@ -534,7 +638,7 @@ pub const Scanner = struct {
         const meta_path = std.fmt.allocPrint(self.a, "{s}/.cursor/acp-sessions/{s}/meta.json", .{ self.home, session_id }) catch return .{};
         const data = self.readAll(meta_path) orelse return .{};
         const v = json.parseFromSliceLeaky(json.Value, self.a, data, .{}) catch return .{};
-        return .{ .project = stringField(v, "cwd") orelse "", .title = titleFromObject(v) orelse "" };
+        return .{ .project = stringField(v, "cwd") orelse "", .title = titleFromFields(v, &.{ "thread_name", "threadName", "title", "session_title", "sessionTitle" }) orelse "" };
     }
 
     /// Parse Cursor Agent transcript JSONL from ~/.cursor/projects/*/agent-transcripts.
@@ -679,13 +783,30 @@ pub const Scanner = struct {
         return x.string;
     }
 
-    fn titleFromObject(v: json.Value) ?[]const u8 {
+    fn titleFromFields(v: json.Value, fields: []const []const u8) ?[]const u8 {
         if (v != .object) return null;
-        for ([_][]const u8{ "title", "session_title", "sessionTitle", "name" }) |name| {
+        for (fields) |name| {
             const title = stringField(v, name) orelse continue;
-            if (std.mem.trim(u8, title, " \t\r\n").len > 0) return title;
+            if (cleanTitle(title)) |safe| return safe;
         }
         return null;
+    }
+
+    fn titleFromObject(v: json.Value) ?[]const u8 {
+        return titleFromFields(v, &.{ "thread_name", "threadName", "title", "session_title", "sessionTitle", "name" });
+    }
+
+    fn cleanTitle(title: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, title, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        if (!std.unicode.utf8ValidateSlice(trimmed)) return null;
+        var i: usize = 0;
+        while (i < trimmed.len) : (i += 1) {
+            const c = trimmed[i];
+            if (c < 0x20 or c == 0x7f) return null;
+            if (i + 3 <= trimmed.len and trimmed[i] == 0xef and trimmed[i + 1] == 0xbf and trimmed[i + 2] == 0xbd) return null;
+        }
+        return trimmed;
     }
 
     fn timestampSeconds(ts: Io.Timestamp) i64 {
@@ -912,7 +1033,14 @@ const testing = std.testing;
 
 fn testScanner(a: std.mem.Allocator) Scanner {
     // io/home unused by the pure parse* functions under test.
-    return .{ .a = a, .io = undefined, .home = "", .records = .empty };
+    return .{
+        .a = a,
+        .io = undefined,
+        .home = "",
+        .records = .empty,
+        .claude_titles = std.StringHashMap([]const u8).init(a),
+        .codex_titles = std.StringHashMap([]const u8).init(a),
+    };
 }
 
 test "parse claude history" {
@@ -934,10 +1062,61 @@ test "parse claude history" {
     try testing.expectEqual(Agent.claude, sc.records.items[0].agent);
 }
 
+test "claude session indexes supply titles to history rows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    const index_data =
+        \\{"entries":[{"sessionId":"s1","summary":"Saved Claude title"},{"sessionId":"s2","slug":"slug-title"},{"sessionId":"s3","summary":"Summary title","customTitle":"Custom Claude title"},{"sessionId":"bad","summary":"bad\u001b[31m"}]}
+    ;
+    sc.parseClaudeSessionsIndex(index_data);
+    const data =
+        \\{"display":"first prompt","project":"/p/one","sessionId":"s1","timestamp":1700000000000}
+        \\{"display":"second prompt","project":"/p/two","sessionId":"s2","timestamp":1700000001000}
+        \\{"display":"third prompt","project":"/p/three","sessionId":"s3","timestamp":1700000001500}
+        \\{"display":"bad prompt","project":"/p/bad","sessionId":"bad","timestamp":1700000002000}
+    ;
+    sc.parseClaudeHistory(data);
+    try testing.expectEqual(@as(usize, 4), sc.records.items.len);
+    try testing.expectEqualStrings("Saved Claude title", sc.records.items[0].title);
+    try testing.expectEqualStrings("slug-title", sc.records.items[1].title);
+    try testing.expectEqualStrings("Custom Claude title", sc.records.items[2].title);
+    try testing.expectEqualStrings("", sc.records.items[3].title);
+}
+
+test "display title extraction rejects control and replacement characters" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    const control = sc.parseLine(
+        \\{"title":"bad\u001b[31m"}
+    ).?;
+    try testing.expect(Scanner.titleFromObject(control) == null);
+    const replacement = sc.parseLine(
+        \\{"title":"bad\ufffdtitle"}
+    ).?;
+    try testing.expect(Scanner.titleFromObject(replacement) == null);
+    const valid = sc.parseLine(
+        \\{"title":"  Useful title  "}
+    ).?;
+    try testing.expectEqualStrings("Useful title", Scanner.titleFromObject(valid).?);
+}
+
+test "cursor title metadata ignores generic name field" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    const v = sc.parseLine(
+        \\{"cwd":"/work/cursor","name":"Generic Cursor metadata name"}
+    ).?;
+    try testing.expect(Scanner.titleFromFields(v, &.{ "thread_name", "threadName", "title", "session_title", "sessionTitle" }) == null);
+}
+
 test "parse codex history" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var sc = testScanner(arena.allocator());
+    try sc.codex_titles.put("abc", "Indexed Codex title");
     const data =
         \\{"session_id":"abc","ts":1779186371,"text":"hello codex"}
         \\{"session_id":"abc","ts":1779186900,"text":""}
@@ -945,6 +1124,7 @@ test "parse codex history" {
     ;
     sc.parseCodexHistory(data);
     try testing.expectEqual(@as(usize, 1), sc.records.items.len);
+    try testing.expectEqualStrings("Indexed Codex title", sc.records.items[0].title);
     try testing.expectEqualStrings("hello codex", sc.records.items[0].text);
     try testing.expectEqualStrings("abc", sc.records.items[0].session);
     try testing.expectEqual(@as(i64, 1779186371), sc.records.items[0].ts);
@@ -977,11 +1157,12 @@ test "codex cache round-trips records and rejects stale source metadata" {
     const cache_data = try writer_sc.buildCodexCache(source, stamp, &records);
 
     var reader_sc = testScanner(a);
+    try reader_sc.codex_titles.put("sess-1", "Indexed title");
     try testing.expect(reader_sc.parseCodexCache(cache_data, source, stamp));
     try testing.expectEqual(@as(usize, 1), reader_sc.records.items.len);
     const rec = reader_sc.records.items[0];
     try testing.expectEqual(Agent.codex, rec.agent);
-    try testing.expectEqualStrings("Cached title", rec.title);
+    try testing.expectEqualStrings("Indexed title", rec.title);
     try testing.expectEqualStrings("cached user prompt", rec.text);
     try testing.expectEqualStrings("/work/proj", rec.project);
     try testing.expectEqualStrings("sess-1", rec.session);
@@ -1002,7 +1183,7 @@ test "codex cache without footer rolls back appended records" {
     try sc.records.append(sc.a, .{ .agent = .claude, .text = "keep", .project = "", .session = "old", .ts = 1 });
     const stamp = SourceStamp{ .size_text = "100", .mtime_text = "200" };
     const data =
-        \\{"kind":"header","version":3,"source":"/source.jsonl","source_size":"100","source_mtime_ns":"200"}
+        \\{"kind":"header","version":4,"source":"/source.jsonl","source_size":"100","source_mtime_ns":"200"}
         \\{"kind":"record","title":"Partial title","text":"partial","project":"/p","session":"s","ts":3,"provider":"","model":"","thinking":"","plan":"","input":0,"output":0,"cache_read":0,"cache_write":0,"total":0,"context_window":0,"rate_percent":0,"cost":0}
     ;
     try testing.expect(!sc.parseCodexCache(data, "/source.jsonl", stamp));
@@ -1014,13 +1195,14 @@ test "codex session fallback timestamp becomes session last active time" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var sc = testScanner(arena.allocator());
+    try sc.codex_titles.put("codex-session", "Indexed Codex title");
     const data =
         \\{"type":"session_meta","payload":{"cwd":"/work/proj","id":"codex-session","title":"Codex session title"}}
         \\{"type":"response_item","timestamp":"2026-06-07T07:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"text","text":"codex prompt"}]}}
     ;
     sc.parseCodexSessionWithLastActive(data, 1770001234);
     try testing.expectEqual(@as(usize, 1), sc.records.items.len);
-    try testing.expectEqualStrings("Codex session title", sc.records.items[0].title);
+    try testing.expectEqualStrings("Indexed Codex title", sc.records.items[0].title);
     try testing.expectEqualStrings("codex prompt", sc.records.items[0].text);
     try testing.expectEqual(@as(i64, 1770001234), sc.records.items[0].ts);
 }

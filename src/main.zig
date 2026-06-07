@@ -88,7 +88,8 @@ pub fn main(init: std.process.Init) !void {
                 \\(run from the session's project directory)
                 \\
                 \\Keys: type to filter · ↑/↓ or ^p/^n move · Enter resume
-                \\      ^d day grouping · ←/→ next day · ^t agents · ^r projects
+                \\      mouse hover selects · click resumes · ^d day grouping
+                \\      PgUp/PgDn day · ^t agents · ^r projects
                 \\      ^f favorite · ^e view · ^y copy · ^o fork
                 \\      Esc/^c quit
                 \\
@@ -108,8 +109,13 @@ pub fn main(init: std.process.Init) !void {
     // CDXC:ZehnUpdateNotification 2026-06-07-08:12:
     // Zehn must never show an automatic update notification during normal search startup. Keep updates explicit through `zehn update` so launches stay quiet and offline unless the user asks to update.
 
+    // CDXC:AgentHistorySearch 2026-06-07-14:59:
+    // Interactive startup can spend visible time indexing previous agent prompts and metadata before the alternate-screen picker appears. Show a transient terminal status line while scanning so users are not left staring at a blank launch.
+    const show_indexing_message = Io.File.stdout().isTty(io) catch false;
+    if (show_indexing_message) try showIndexingMessage(w);
     var sc = scan.Scanner.init(a, io, home);
     sc.scanAll();
+    if (show_indexing_message) try clearIndexingMessage(w);
     if (agent_filter) |agent| filterRecordsByAgent(&sc.records, agent);
 
     if (sc.sqlite_missing) {
@@ -155,6 +161,16 @@ pub fn main(init: std.process.Init) !void {
             .fork => try forkSession(init, io, w, rec, action.fork_agent),
         }
     }
+}
+
+fn showIndexingMessage(w: *Io.Writer) !void {
+    try w.writeAll("\r\x1b[2KLoading: Indexing Previous User Prompts...");
+    try w.flush();
+}
+
+fn clearIndexingMessage(w: *Io.Writer) !void {
+    try w.writeAll("\r\x1b[2K");
+    try w.flush();
 }
 
 fn usageError(w: *Io.Writer, msg: []const u8) !void {

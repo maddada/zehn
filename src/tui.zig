@@ -35,6 +35,9 @@ fn oom() noreturn {
     @panic("out of memory");
 }
 
+const enter_tui_sequence = "\x1b[?1049h\x1b[?25l\x1b[?1006h\x1b[?1003h";
+const leave_tui_sequence = "\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[?1049l";
+
 // Saved terminal state for restoration from a signal handler (which cannot
 // take arguments). Set while the TUI owns the terminal.
 var g_orig: posix.termios = undefined;
@@ -43,7 +46,7 @@ var g_active: bool = false;
 fn restoreTerminal() void {
     if (!g_active) return;
     g_active = false;
-    const seq = "\x1b[?25h\x1b[?1049l"; // show cursor, leave alt-screen
+    const seq = leave_tui_sequence;
     switch (builtin.os.tag) {
         .linux => _ = std.os.linux.write(1, seq.ptr, seq.len),
         else => _ = std.c.write(1, seq.ptr, seq.len),
@@ -86,6 +89,13 @@ const ViewRow = union(enum) {
     hit: usize,
 };
 
+const MouseEvent = struct {
+    button: usize,
+    x: usize,
+    y: usize,
+    final: u8,
+};
+
 const seconds_per_day: i64 = 86_400;
 const unknown_day_key: i64 = std.math.minInt(i64);
 
@@ -100,6 +110,13 @@ fn agentColor(a: scan.Agent) []const u8 {
         .grok => "\x1b[38;2;180;160;255m", // xAI/Grok purple accent
     };
 }
+
+const selected_result_style = "\x1b[48;2;42;42;42m\x1b[38;2;202;160;66m";
+const muted_result_style = "\x1b[90m";
+const reset_style = "\x1b[0m";
+const result_lead_cols: usize = 4; // indicator + favorite slot + spacing
+const result_agent_cols: usize = 8;
+const result_gap_cols: usize = 1;
 
 pub const Tui = struct {
     a: std.mem.Allocator,
@@ -117,8 +134,15 @@ pub const Tui = struct {
     wrap_preview: bool = true,
     fullscreen_preview: bool = false,
     // CDXC:AgentHistorySearch 2026-06-07-08:27:
-    // Search results should default to day-grouped browsing so users can see when sessions were last active. Ctrl-D toggles the grouping, and plain left/right jump to the first session in adjacent day groups while grouped.
+    // Search results should default to day-grouped browsing so users can see when sessions were last active. Ctrl-D toggles the grouping.
+    // CDXC:AgentHistorySearch 2026-06-07-15:12:
+    // Plain left/right must stay available for query editing or preview horizontal scroll. Grouped day jumps use PageUp/PageDown, with Ctrl-Up/Ctrl-Down as an extra path when the terminal reports modified arrow keys.
+    // CDXC:AgentHistorySearch 2026-06-07-11:27:
+    // Result rows should be prompt-first two-line entries: agent and matched prompt on line one, last-active time under the agent, and the gray session title/id starting under the prompt text on line two. Selected rows use gold text on a silver background across both lines, and blank spacer rows separate entries.
     group_by_day: bool = true,
+    // CDXC:AgentHistorySearch 2026-06-07-12:24:
+    // The result list is mouse-addressable: hovering a session selects it, and a left-click on a session returns the same resume action as Enter. Use SGR mouse coordinates and the rendered view-row model so grouped day headers and spacer rows map predictably.
+    mouse_resume_requested: bool = false,
     /// Bit mask of selected agents in the interactive picker. 0 means no
     /// filter, so all agents are shown.
     agent_filter_mask: u8 = 0,
@@ -292,7 +316,7 @@ pub const Tui = struct {
     fn viewRowHeight(row: ViewRow) usize {
         return switch (row) {
             .day => 1,
-            .hit => 2,
+            .hit => 3,
         };
     }
 
@@ -303,6 +327,30 @@ pub const Tui = struct {
             offset += viewRowHeight(self.view_rows.items[i]);
         }
         return offset;
+    }
+
+    fn hitAtListRow(self: *const Tui, list_row: usize) ?usize {
+        var visual: usize = 0;
+        var i = self.top;
+        while (i < self.view_rows.items.len) : (i += 1) {
+            const row = self.view_rows.items[i];
+            const height = viewRowHeight(row);
+            if (list_row < visual + height) {
+                return switch (row) {
+                    .hit => |hit_idx| hit_idx,
+                    .day => null,
+                };
+            }
+            visual += height;
+        }
+        return null;
+    }
+
+    fn hitAtMouseY(self: *Tui, y: usize) ?usize {
+        if (y <= 1) return null;
+        const list_row = y - 2;
+        if (list_row >= self.listHeight()) return null;
+        return self.hitAtListRow(list_row);
     }
 
     fn clampScroll(self: *Tui) void {
@@ -348,7 +396,7 @@ pub const Tui = struct {
             const is_ctrl = d.cp < 0x20 or (d.cp >= 0x7f and d.cp < 0xa0);
             const cw: usize = if (is_ctrl) 1 else uni.charWidth(d.cp);
             if (used + cw > max) {
-                buf.appendSlice(self.a, "…") catch oom();
+                if (max > 0 and used < max) buf.appendSlice(self.a, "…") catch oom();
                 return;
             }
             // advance highlight cursor past any positions before i
@@ -356,7 +404,7 @@ pub const Tui = struct {
             const hl = pi < m.pos_len and m.positions[pi] == i;
             if (hl) {
                 pi += 1;
-                buf.appendSlice(self.a, "\x1b[1;33m") catch oom(); // bold yellow
+                buf.appendSlice(self.a, if (selected) "\x1b[1m" else "\x1b[1;33m") catch oom(); // bold accent
             }
             if (is_ctrl) {
                 buf.append(self.a, ' ') catch oom();
@@ -364,8 +412,8 @@ pub const Tui = struct {
                 buf.appendSlice(self.a, text[i .. i + d.len]) catch oom();
             }
             if (hl) {
-                buf.appendSlice(self.a, "\x1b[0m") catch oom();
-                if (selected) buf.appendSlice(self.a, "\x1b[7m") catch oom();
+                buf.appendSlice(self.a, reset_style) catch oom();
+                if (selected) buf.appendSlice(self.a, selected_result_style) catch oom();
             }
             used += cw;
             i += d.len;
@@ -383,59 +431,66 @@ pub const Tui = struct {
         const hit = self.hits.items[hit_idx];
         const rec = self.records[hit.idx];
         const selected = hit_idx == self.sel;
-        if (selected) {
-            b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
-            b.appendSlice(self.a, "▌\x1b[0m\x1b[7m ") catch oom();
+        self.writeResultLead(b, selected, true, hit.fav);
+        if (!selected) b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
+        var agent_buf: [16]u8 = undefined;
+        const agent = std.fmt.bufPrint(&agent_buf, "{s: <8}", .{rec.agent.label()}) catch rec.agent.label();
+        b.appendSlice(self.a, agent) catch oom();
+        if (!selected) b.appendSlice(self.a, reset_style) catch oom();
+        b.append(self.a, ' ') catch oom();
+        const prompt_max = @min(text_max, self.resultPromptCols());
+        self.writeHighlighted(b, rec.text, hit.m, prompt_max, selected);
+        self.finishResultLine(b, selected);
+        if (max_lines == 1) return 1;
+
+        self.writeResultLead(b, selected, false, false);
+        var compact_buf: [16]u8 = undefined;
+        var time_buf: [16]u8 = undefined;
+        const compact = formatLastActiveCompact(&compact_buf, rec.ts, now);
+        const time_label = std.fmt.bufPrint(&time_buf, "{s: <8}", .{compact}) catch compact;
+        if (!selected) b.appendSlice(self.a, muted_result_style) catch oom();
+        b.appendSlice(self.a, time_label) catch oom();
+        if (!selected) b.appendSlice(self.a, reset_style) catch oom();
+        b.append(self.a, ' ') catch oom();
+        self.writeInlineSessionTitle(b, rec, selected);
+        self.finishResultLine(b, selected);
+        if (max_lines == 2) return 2;
+
+        b.appendSlice(self.a, "\r\n") catch oom();
+        return 3;
+    }
+
+    fn writeResultLead(self: *Tui, b: *std.ArrayList(u8), selected: bool, marker: bool, favorite: bool) void {
+        if (selected) b.appendSlice(self.a, selected_result_style) catch oom();
+        if (selected and marker) {
+            b.appendSlice(self.a, "› ") catch oom();
         } else {
             b.appendSlice(self.a, "  ") catch oom();
         }
-        if (hit.fav) {
+        if (favorite) {
             if (selected) {
                 b.appendSlice(self.a, "★") catch oom();
             } else {
-                b.appendSlice(self.a, "\x1b[1;33m★\x1b[0m") catch oom();
+                b.appendSlice(self.a, "\x1b[1;33m★") catch oom();
+                b.appendSlice(self.a, reset_style) catch oom();
             }
-            if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
         } else {
             b.append(self.a, ' ') catch oom();
         }
         b.append(self.a, ' ') catch oom();
+    }
 
-        if (!selected) b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
-        var agent_buf: [16]u8 = undefined;
-        const agent = std.fmt.bufPrint(&agent_buf, "{s: <7}", .{rec.agent.label()}) catch rec.agent.label();
-        b.appendSlice(self.a, agent) catch oom();
-        if (!selected) b.appendSlice(self.a, "\x1b[0m") catch oom();
-        if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
+    fn finishResultLine(self: *Tui, b: *std.ArrayList(u8), selected: bool) void {
+        if (selected) b.appendSlice(self.a, "\x1b[K") catch oom();
+        b.appendSlice(self.a, reset_style) catch oom();
+        b.appendSlice(self.a, "\r\n") catch oom();
+    }
 
-        var compact_buf: [16]u8 = undefined;
-        var time_buf: [16]u8 = undefined;
-        const compact = formatLastActiveCompact(&compact_buf, rec.ts, now);
-        const time_label = std.fmt.bufPrint(&time_buf, "{s: >7}", .{compact}) catch compact;
-        b.append(self.a, ' ') catch oom();
-        if (!selected) b.appendSlice(self.a, "\x1b[90m") catch oom();
-        b.appendSlice(self.a, time_label) catch oom();
-        if (!selected) b.appendSlice(self.a, "\x1b[0m") catch oom();
-        if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
-
-        b.append(self.a, ' ') catch oom();
-        if (selected) b.appendSlice(self.a, "\x1b[1m") catch oom();
-        self.appendPlainTruncated(b, sessionTitle(rec), text_max);
-        b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
-        if (max_lines == 1) return 1;
-
-        if (selected) {
-            b.appendSlice(self.a, "\x1b[7m    ") catch oom();
-        } else {
-            b.appendSlice(self.a, "    ") catch oom();
-        }
-        b.appendSlice(self.a, "\x1b[90m") catch oom();
-        b.appendSlice(self.a, "prompt ") catch oom();
-        b.appendSlice(self.a, "\x1b[0m") catch oom();
-        if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
-        self.writeHighlighted(b, rec.text, hit.m, text_max, selected);
-        b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
-        return 2;
+    fn writeInlineSessionTitle(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record, selected: bool) void {
+        const title = sessionTitle(rec);
+        if (!selected) b.appendSlice(self.a, muted_result_style) catch oom();
+        self.appendPlainTruncated(b, title, self.resultPromptCols());
+        if (!selected) b.appendSlice(self.a, reset_style) catch oom();
     }
 
     fn sessionTitle(rec: scan.Record) []const u8 {
@@ -444,14 +499,25 @@ pub const Tui = struct {
         return "Untitled session";
     }
 
+    fn resultLineCols(self: *const Tui) usize {
+        const cols: usize = self.cols;
+        return cols -| 1;
+    }
+
+    fn resultPromptCols(self: *const Tui) usize {
+        const used = result_lead_cols + result_agent_cols + result_gap_cols;
+        const line_cols = self.resultLineCols();
+        return if (line_cols > used) line_cols - used else 0;
+    }
+
     fn formatLastActiveCompact(buf: *[16]u8, ts: i64, now: i64) []const u8 {
         if (ts <= 0) return "unknown";
         var delta = now - ts;
         if (delta < 0) delta = 0;
         if (delta < 60) return "now";
-        if (delta < 3_600) return std.fmt.bufPrint(buf, "{d}m", .{@divTrunc(delta, 60)}) catch "now";
-        if (delta < seconds_per_day) return std.fmt.bufPrint(buf, "{d}h", .{@divTrunc(delta, 3_600)}) catch "now";
-        if (delta < 7 * seconds_per_day) return std.fmt.bufPrint(buf, "{d}d", .{@divTrunc(delta, seconds_per_day)}) catch "now";
+        if (delta < 3_600) return std.fmt.bufPrint(buf, "{d}m ago", .{@divTrunc(delta, 60)}) catch "now";
+        if (delta < seconds_per_day) return std.fmt.bufPrint(buf, "{d}h ago", .{@divTrunc(delta, 3_600)}) catch "now";
+        if (delta < 7 * seconds_per_day) return std.fmt.bufPrint(buf, "{d}d ago", .{@divTrunc(delta, seconds_per_day)}) catch "now";
         const date = civilFromDayKey(dayKey(ts));
         return std.fmt.bufPrint(buf, "{s} {d}", .{ monthName(date.month), date.day }) catch "unknown";
     }
@@ -536,7 +602,7 @@ pub const Tui = struct {
 
         const h = self.listHeight();
         const now = self.nowSeconds();
-        const text_max: usize = if (self.cols > 24) self.cols - 24 else 20;
+        const text_max: usize = self.resultPromptCols();
         var row: usize = 0;
         var row_idx = self.top;
         while (row < h) {
@@ -647,10 +713,10 @@ pub const Tui = struct {
         installSignalHandlers();
         try self.enterRaw();
         defer self.leaveRaw();
-        try w.writeAll("\x1b[?1049h\x1b[?25l"); // alt screen, hide cursor
+        try w.writeAll(enter_tui_sequence);
         try w.flush();
         defer {
-            w.writeAll("\x1b[?25h\x1b[?1049l") catch {}; // show cursor, leave alt screen
+            w.writeAll(leave_tui_sequence) catch {};
             w.flush() catch {};
         }
 
@@ -765,6 +831,7 @@ pub const Tui = struct {
                 if (c == 27) {
                     if (self.handleEscapeSequence(ibuf[i..n])) |consumed| {
                         i += consumed;
+                        if (self.takeMouseResumeAction()) |action| return action;
                         continue;
                     }
                     return null; // bare ESC quits
@@ -855,9 +922,57 @@ pub const Tui = struct {
 
     fn selectHit(self: *Tui, hit_idx: usize) void {
         if (hit_idx >= self.hits.items.len) return;
+        if (self.sel == hit_idx) return;
         self.sel = hit_idx;
         self.preview_scroll = 0;
         self.result_scroll = 0;
+    }
+
+    fn takeMouseResumeAction(self: *Tui) ?Action {
+        if (!self.mouse_resume_requested) return null;
+        self.mouse_resume_requested = false;
+        if (self.sel >= self.hits.items.len) return null;
+        return .{ .idx = self.hits.items[self.sel].idx, .kind = .resume_session };
+    }
+
+    fn handleMouseEvent(self: *Tui, ev: MouseEvent) void {
+        if (self.filtering_agent or self.filtering_project or self.forking) return;
+        if ((ev.button & 64) != 0) {
+            switch (ev.button & 3) {
+                0 => self.moveUp(),
+                1 => self.moveDown(),
+                else => {},
+            }
+            return;
+        }
+        const hit_idx = self.hitAtMouseY(ev.y) orelse return;
+        self.selectHit(hit_idx);
+        if (ev.final == 'M' and (ev.button & 3) == 0 and (ev.button & 32) == 0) {
+            self.mouse_resume_requested = true;
+        }
+    }
+
+    fn parseSgrMouse(bytes: []const u8) ?struct { event: MouseEvent, consumed: usize } {
+        if (bytes.len < 6 or bytes[0] != 27 or bytes[1] != '[' or bytes[2] != '<') return null;
+        var i: usize = 3;
+        const button = parseMouseNumber(bytes, &i) orelse return null;
+        if (i >= bytes.len or bytes[i] != ';') return null;
+        i += 1;
+        const x = parseMouseNumber(bytes, &i) orelse return null;
+        if (i >= bytes.len or bytes[i] != ';') return null;
+        i += 1;
+        const y = parseMouseNumber(bytes, &i) orelse return null;
+        if (i >= bytes.len or (bytes[i] != 'M' and bytes[i] != 'm')) return null;
+        return .{ .event = .{ .button = button, .x = x, .y = y, .final = bytes[i] }, .consumed = i + 1 };
+    }
+
+    fn parseMouseNumber(bytes: []const u8, index: *usize) ?usize {
+        if (index.* >= bytes.len or bytes[index.*] < '0' or bytes[index.*] > '9') return null;
+        var value: usize = 0;
+        while (index.* < bytes.len and bytes[index.*] >= '0' and bytes[index.*] <= '9') : (index.* += 1) {
+            value = value * 10 + (bytes[index.*] - '0');
+        }
+        return value;
     }
 
     fn jumpDay(self: *Tui, delta: isize) void {
@@ -886,12 +1001,19 @@ pub const Tui = struct {
 
     fn handleEscapeSequence(self: *Tui, bytes: []const u8) ?usize {
         if (bytes.len < 3 or bytes[0] != 27 or bytes[1] != '[') return null;
+        if (bytes[2] == '<') {
+            if (parseSgrMouse(bytes)) |parsed| {
+                self.handleMouseEvent(parsed.event);
+                return parsed.consumed;
+            }
+            return bytes.len;
+        }
         if (bytes[2] == '5' and bytes.len >= 4 and bytes[3] == '~') {
-            self.scrollPreview(-1);
+            if (self.preview_focus) self.scrollPreview(-1) else if (self.group_by_day) self.jumpDay(-1);
             return 4;
         }
         if (bytes[2] == '6' and bytes.len >= 4 and bytes[3] == '~') {
-            self.scrollPreview(1);
+            if (self.preview_focus) self.scrollPreview(1) else if (self.group_by_day) self.jumpDay(1);
             return 4;
         }
         if (bytes[2] == '3' and bytes.len >= 6 and bytes[3] == ';' and bytes[4] == '5' and bytes[5] == '~') {
@@ -908,6 +1030,12 @@ pub const Tui = struct {
         }
         if (bytes.len >= 6 and bytes[2] == '1' and bytes[3] == ';' and bytes[4] == '5') {
             switch (bytes[5]) {
+                'A' => { // ctrl-up
+                    if (self.filtering_project) self.moveProjectSelection(-1) else if (self.filtering_agent) self.moveFilterSelection(-1) else if (self.group_by_day) self.jumpDay(-1) else self.moveUp();
+                },
+                'B' => { // ctrl-down
+                    if (self.filtering_project) self.moveProjectSelection(1) else if (self.filtering_agent) self.moveFilterSelection(1) else if (self.group_by_day) self.jumpDay(1) else self.moveDown();
+                },
                 'C' => { // ctrl-right
                     if (self.preview_focus) self.scrollResultToEnd() else self.moveWordRight();
                 },
@@ -921,8 +1049,8 @@ pub const Tui = struct {
         switch (bytes[2]) {
             'A' => if (self.filtering_project) self.moveProjectSelection(-1) else if (self.filtering_agent) self.moveFilterSelection(-1) else self.moveUp(),
             'B' => if (self.filtering_project) self.moveProjectSelection(1) else if (self.filtering_agent) self.moveFilterSelection(1) else self.moveDown(),
-            'C' => if (self.preview_focus) self.scrollResult(8) else if (self.group_by_day) self.jumpDay(1) else self.moveRight(),
-            'D' => if (self.preview_focus) self.scrollResult(-8) else if (self.group_by_day) self.jumpDay(-1) else self.moveLeft(),
+            'C' => if (self.preview_focus) self.scrollResult(8) else self.moveRight(),
+            'D' => if (self.preview_focus) self.scrollResult(-8) else self.moveLeft(),
             else => {},
         }
         return 3;
@@ -1072,7 +1200,7 @@ pub const Tui = struct {
             const is_ctrl = d.cp < 0x20 or (d.cp >= 0x7f and d.cp < 0xa0);
             const cw: usize = if (is_ctrl) 1 else uni.charWidth(d.cp);
             if (used + cw > max_cols) {
-                if (max_cols > 0) b.appendSlice(self.a, "…") catch oom();
+                if (max_cols > 0 and used < max_cols) b.appendSlice(self.a, "…") catch oom();
                 return;
             }
             if (is_ctrl) b.append(self.a, ' ') catch oom() else b.appendSlice(self.a, text[i .. i + d.len]) catch oom();
@@ -1491,6 +1619,7 @@ test "query supports word movement and word deletion" {
 test "page up and down escape sequences scroll preview without typing tilde" {
     var tui = testTui();
     defer tui.query.deinit(testing.allocator);
+    tui.preview_focus = true;
 
     try testing.expectEqual(@as(?usize, 4), tui.handleEscapeSequence("\x1b[6~"));
     try testing.expectEqual(@as(usize, 1), tui.preview_scroll);
@@ -1599,7 +1728,7 @@ test "default results are grouped by last-active day" {
     try testing.expectEqual(Tui.dayKey(day_old), tui.view_rows.items[3].day);
 }
 
-test "grouped left and right arrows jump to adjacent day starts" {
+test "grouped page keys and ctrl arrows jump to adjacent day starts" {
     var fav = favorites.Set.init(testing.allocator);
     defer fav.deinit();
     const day_a = 20_000 * seconds_per_day;
@@ -1615,11 +1744,85 @@ test "grouped left and right arrows jump to adjacent day starts" {
     tui.recompute();
     tui.sel = 1;
 
-    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[C"));
+    try testing.expectEqual(@as(?usize, 4), tui.handleEscapeSequence("\x1b[6~"));
     try testing.expectEqual(@as(u32, 0), tui.hits.items[tui.sel].idx);
 
-    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[D"));
+    try testing.expectEqual(@as(?usize, 4), tui.handleEscapeSequence("\x1b[5~"));
     try testing.expectEqual(@as(u32, 1), tui.hits.items[tui.sel].idx);
+
+    try testing.expectEqual(@as(?usize, 6), tui.handleEscapeSequence("\x1b[1;5B"));
+    try testing.expectEqual(@as(u32, 0), tui.hits.items[tui.sel].idx);
+
+    try testing.expectEqual(@as(?usize, 6), tui.handleEscapeSequence("\x1b[1;5A"));
+    try testing.expectEqual(@as(u32, 1), tui.hits.items[tui.sel].idx);
+}
+
+test "grouped left and right arrows edit query instead of jumping days" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const day_a = 20_000 * seconds_per_day;
+    const day_b = 20_001 * seconds_per_day;
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "a", .text = "same", .ts = day_a + 1 },
+        .{ .agent = .claude, .project = "p", .session = "b", .text = "same", .ts = day_b + 1 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+    defer tui.query.deinit(testing.allocator);
+    tui.recompute();
+    tui.sel = 1;
+    try tui.query.appendSlice(testing.allocator, "ab");
+    tui.query_cursor = 1;
+
+    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[C"));
+    try testing.expectEqual(@as(usize, 2), tui.query_cursor);
+    try testing.expectEqual(@as(usize, 1), tui.sel);
+
+    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[D"));
+    try testing.expectEqual(@as(usize, 1), tui.query_cursor);
+    try testing.expectEqual(@as(usize, 1), tui.sel);
+}
+
+test "mouse hover selects result row" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "a", .text = "first", .ts = 1 },
+        .{ .agent = .claude, .project = "p", .session = "b", .text = "second", .ts = 1 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+    tui.group_by_day = false;
+    tui.recompute();
+
+    const hover_second = "\x1b[<35;12;5M";
+    try testing.expectEqual(@as(?usize, hover_second.len), tui.handleEscapeSequence(hover_second));
+
+    try testing.expectEqual(@as(usize, 1), tui.sel);
+}
+
+test "mouse click on result row resumes selected session" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "a", .text = "first", .ts = 1 },
+        .{ .agent = .claude, .project = "p", .session = "b", .text = "second", .ts = 1 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+    tui.group_by_day = false;
+    tui.recompute();
+
+    const click_second = "\x1b[<0;12;5M";
+    try testing.expectEqual(@as(?usize, click_second.len), tui.handleEscapeSequence(click_second));
+    const action = tui.takeMouseResumeAction().?;
+
+    try testing.expectEqual(@as(usize, 1), tui.sel);
+    try testing.expectEqual(@as(u32, 1), action.idx);
+    try testing.expectEqual(Action.Kind.resume_session, action.kind);
 }
 
 test "flat result row still shows compact last-active time" {
@@ -1636,18 +1839,21 @@ test "flat result row still shows compact last-active time" {
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 2), tui.writeResultRow(&out, 0, 40, 3_600, 2));
+    try testing.expectEqual(@as(usize, 3), tui.writeResultRow(&out, 0, 40, 3_600, 3));
 
-    try testing.expect(std.mem.indexOf(u8, out.items, "30m") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "Session title") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "recent prompt") != null);
+    const prompt_pos = std.mem.indexOf(u8, out.items, "recent prompt").?;
+    const title_pos = std.mem.indexOf(u8, out.items, "Session title").?;
+    try testing.expect(std.mem.indexOf(u8, out.items, "30m ago") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "30m ago  Session title") != null);
+    try testing.expect(prompt_pos < title_pos);
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, out.items, "\r\n"));
 }
 
-test "result row title falls back to session id" {
+test "cursor result row title falls back to session id" {
     var fav = favorites.Set.init(testing.allocator);
     defer fav.deinit();
     const records = [_]scan.Record{
-        .{ .agent = .claude, .project = "p", .session = "session-123", .text = "prompt text", .ts = 1_800 },
+        .{ .agent = .cursor, .project = "p", .session = "cursor-session-123", .text = "prompt text", .ts = 1_800 },
     };
     var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
     defer tui.hits.deinit(testing.allocator);
@@ -1657,10 +1863,30 @@ test "result row title falls back to session id" {
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
-    _ = tui.writeResultRow(&out, 0, 40, 3_600, 2);
+    _ = tui.writeResultRow(&out, 0, 40, 3_600, 3);
 
-    try testing.expect(std.mem.indexOf(u8, out.items, "session-123") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "cursor-session-123") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "prompt text") != null);
+}
+
+test "selected result row uses gold on silver styling" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "s", .text = "selected prompt", .ts = 1_800 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+    tui.group_by_day = false;
+    tui.recompute();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    _ = tui.writeResultRow(&out, 0, 40, 3_600, 3);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, selected_result_style) != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\x1b[7m") == null);
 }
 
 test "interactive agent filter picker filters hits" {

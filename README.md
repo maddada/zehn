@@ -87,9 +87,9 @@ zehn update      # update to the latest master build
 zehn --version
 ```
 
-Results are grouped by last-active day by default, with the newest day first. Each result uses two lines: the source-provided session title first, then the matched prompt text. Press `^d` to toggle day grouping on or off. In grouped mode, left/right jumps to the first session in the previous/next day group.
+Results are grouped by last-active day by default, with the newest day first. Each result uses two content lines plus a spacer: the agent and matched prompt first, then the last-active time under the agent and the session title or session id under the prompt. Press `^d` to toggle day grouping on or off. In grouped mode, PageUp/PageDown jumps to the first session in the previous/next day group; terminals that report modified arrows can also use Ctrl-Up/Ctrl-Down.
 
-Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit. Press `^t` for the agent picker, or `^r` for the project picker. The search box has the usual readline-ish editing when day grouping is off: left/right, Ctrl-left/right, Ctrl-U, Ctrl-K, Ctrl-backspace, and Ctrl-delete.
+Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit. Mouse hover selects a session, and click resumes it. Press `^t` for the agent picker, or `^r` for the project picker. The search box has the usual readline-ish editing: left/right, Ctrl-left/right, Ctrl-U, Ctrl-K, Ctrl-backspace, and Ctrl-delete.
 
 Long prompts are a thing, especially if you use `/skill` blocks. Press Tab to focus the preview, PageUp/PageDown to scroll it, left/right to horizontally scroll the selected result, Ctrl-right/Ctrl-left to jump that result to the end/start, `W` to toggle wrapping, and `F` for a larger preview.
 
@@ -125,9 +125,11 @@ Each agent shows up in its own brand color, and each result shows a compact last
 opencode keeps its history in a SQLite database, so reading it needs the `sqlite3` CLI on your `PATH`. If it is missing, zehn skips opencode and says so instead of failing.
 
 Codex session files can get large. zehn keeps a derived cache of extracted Codex
-user prompts in `~/.ghostex/zehn/codex-sessions-v3`, invalidated by each source
-file's size and modified time. The original session files remain the source of
-truth, and the cache can be deleted at any time.
+user prompts in `~/.ghostex/zehn/codex-sessions-v4`, invalidated by each source
+file's size and modified time. Codex titles are read from `~/.codex/session_index.jsonl`
+by session id so title changes can still appear when the transcript cache is warm.
+The original session files remain the source of truth, and the cache can be
+deleted at any time.
 
 ## How matching works
 
