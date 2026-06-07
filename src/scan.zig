@@ -53,10 +53,11 @@ pub const Meta = struct {
 
 pub const Record = struct {
     agent: Agent,
+    title: []const u8 = "",
     text: []const u8,
     project: []const u8,
     session: []const u8,
-    ts: i64, // unix seconds, 0 if unknown
+    ts: i64, // session last-active unix seconds, 0 if unknown
     meta: Meta = .{},
 };
 
@@ -67,7 +68,11 @@ pub const Record = struct {
 // Cursor Agent and Grok should participate in the same cross-agent history picker and resume flow.
 // Cursor prompt text is read from local Cursor project agent-transcript JSONL files; matching ACP metadata is optional and only supplies cwd when present.
 // Grok prompt text is read from ~/.grok/sessions/<encoded-cwd>/<session-id>/chat_history.jsonl while summary.json supplies session id, cwd, and model metadata.
-const codex_cache_version = 1;
+// CDXC:AgentHistorySearch 2026-06-07-08:27:
+// Zehn result rows and day grouping need a dependable last-active time for every session. Preserve `Record.ts` in the Codex derived cache and fall back to session file mtimes when an agent history format does not expose a timestamp per prompt.
+// CDXC:AgentHistorySearch 2026-06-07-08:39:
+// Result rows now show the source-provided session title on the first line and the matched prompt text on the second. Keep titles as explicit record metadata and preserve them through derived caches instead of deriving titles from private prompt content.
+const codex_cache_version = 3;
 
 const SourceStamp = struct {
     size_text: []const u8,
@@ -181,6 +186,7 @@ pub const Scanner = struct {
             // file buffer) and persist for the program's lifetime.
             self.add(.{
                 .agent = .claude,
+                .title = titleFromObject(v) orelse "",
                 .text = disp.string,
                 .project = proj,
                 .session = sess,
@@ -227,26 +233,27 @@ pub const Scanner = struct {
 
     fn scanCodexSessionCached(self: *Scanner, source_path: []const u8) void {
         const stat = Io.Dir.cwd().statFile(self.io, source_path, .{}) catch return;
+        const fallback_ts = timestampSeconds(stat.mtime);
         const stamp = self.stampFromStat(stat) orelse {
-            _ = self.scanCodexSessionUncached(source_path);
+            _ = self.scanCodexSessionUncached(source_path, fallback_ts);
             return;
         };
         const cache_path = self.codexCachePath(source_path) orelse {
-            _ = self.scanCodexSessionUncached(source_path);
+            _ = self.scanCodexSessionUncached(source_path, fallback_ts);
             return;
         };
         if (self.readAll(cache_path)) |data| {
             if (self.parseCodexCache(data, source_path, stamp)) return;
         }
         const record_start = self.records.items.len;
-        if (self.scanCodexSessionUncached(source_path)) {
+        if (self.scanCodexSessionUncached(source_path, fallback_ts)) {
             self.saveCodexCache(cache_path, source_path, stamp, self.records.items[record_start..]);
         }
     }
 
-    fn scanCodexSessionUncached(self: *Scanner, source_path: []const u8) bool {
+    fn scanCodexSessionUncached(self: *Scanner, source_path: []const u8, fallback_ts: i64) bool {
         const data = self.readAll(source_path) orelse return false;
-        self.parseCodexSession(data);
+        self.parseCodexSessionWithLastActive(data, fallback_ts);
         return true;
     }
 
@@ -261,7 +268,7 @@ pub const Scanner = struct {
         var h = std.hash.Wyhash.init(0);
         h.update(source_path);
         const id = h.final();
-        return std.fmt.allocPrint(self.a, "{s}/.ghostex/zehn/codex-sessions-v1/{x:0>16}.jsonl", .{ self.home, id }) catch null;
+        return std.fmt.allocPrint(self.a, "{s}/.ghostex/zehn/codex-sessions-v3/{x:0>16}.jsonl", .{ self.home, id }) catch null;
     }
 
     fn saveCodexCache(self: *Scanner, cache_path: []const u8, source_path: []const u8, stamp: SourceStamp, records: []const Record) void {
@@ -285,9 +292,11 @@ pub const Scanner = struct {
         for (records) |rec| {
             try buf.print(self.a, "{f}\n", .{json.fmt(.{
                 .kind = "record",
+                .title = rec.title,
                 .text = rec.text,
                 .project = rec.project,
                 .session = rec.session,
+                .ts = rec.ts,
                 .provider = rec.meta.provider,
                 .model = rec.meta.model,
                 .thinking = rec.meta.thinking,
@@ -327,10 +336,11 @@ pub const Scanner = struct {
             if (text.len == 0) continue;
             self.add(.{
                 .agent = .codex,
+                .title = stringField(v, "title") orelse "",
                 .text = text,
                 .project = stringField(v, "project") orelse "",
                 .session = stringField(v, "session") orelse "",
-                .ts = 0,
+                .ts = timestampValue(fieldValue(v, "ts") orelse .{ .integer = 0 }),
                 .meta = .{
                     .provider = stringField(v, "provider") orelse "",
                     .model = stringField(v, "model") orelse "",
@@ -380,6 +390,7 @@ pub const Scanner = struct {
             };
             self.add(.{
                 .agent = .codex,
+                .title = titleFromObject(v) orelse "",
                 .text = txt.string,
                 .project = "",
                 .session = sess,
@@ -389,14 +400,20 @@ pub const Scanner = struct {
     }
 
     pub fn parseCodexSession(self: *Scanner, data: []const u8) void {
+        self.parseCodexSessionWithLastActive(data, 0);
+    }
+
+    fn parseCodexSessionWithLastActive(self: *Scanner, data: []const u8, fallback_ts: i64) void {
         var cwd: []const u8 = "";
         var session_id: []const u8 = "";
+        var session_title: []const u8 = "";
         var meta: Meta = .{};
         const record_start = self.records.items.len;
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
             const v = self.parseLine(line) orelse continue;
             if (v != .object) continue;
+            const line_ts = timestampFromObject(v);
             const o = v.object;
             const typ = o.get("type") orelse continue;
             if (typ != .string) continue;
@@ -409,6 +426,10 @@ pub const Scanner = struct {
                 if (payload.object.get("id")) |x| if (x == .string) {
                     session_id = x.string;
                 };
+                if (titleFromObject(payload)) |title| {
+                    session_title = title;
+                    self.applyTitleToSessionRecords(record_start, session_title);
+                }
                 if (payload.object.get("model_provider")) |x| if (x == .string) {
                     meta.provider = x.string;
                 };
@@ -450,7 +471,7 @@ pub const Scanner = struct {
             const content = payload.object.get("content") orelse continue;
             const text = self.contentText(content) orelse continue;
             if (text.len == 0 or std.mem.startsWith(u8, text, "<")) continue;
-            self.add(.{ .agent = .codex, .text = text, .project = cwd, .session = session_id, .ts = 0, .meta = meta });
+            self.add(.{ .agent = .codex, .title = session_title, .text = text, .project = cwd, .session = session_id, .ts = if (fallback_ts > 0) fallback_ts else line_ts, .meta = meta });
         }
     }
 
@@ -474,8 +495,9 @@ pub const Scanner = struct {
     }
 
     fn scanPiFile(self: *Scanner, file_path: []const u8) void {
+        const fallback_ts = if (Io.Dir.cwd().statFile(self.io, file_path, .{})) |stat| timestampSeconds(stat.mtime) else |_| 0;
         const data = self.readAll(file_path) orelse return;
-        self.parsePiSession(data);
+        self.parsePiSessionWithLastActive(data, fallback_ts);
     }
 
     fn scanCursor(self: *Scanner) void {
@@ -497,21 +519,26 @@ pub const Scanner = struct {
                 defer session_dir.close(self.io);
                 const stat = session_dir.statFile(self.io, file_name, .{}) catch continue;
                 const data = session_dir.readFileAlloc(self.io, file_name, self.a, .limited(64 * 1024 * 1024)) catch continue;
-                const project = self.cursorProjectForSession(se.name) orelse "";
-                self.parseCursorTranscript(data, project, se.name, timestampSeconds(stat.mtime));
+                const info = self.cursorInfoForSession(se.name);
+                self.parseCursorTranscript(data, info.project, info.title, se.name, timestampSeconds(stat.mtime));
             }
         }
     }
 
-    fn cursorProjectForSession(self: *Scanner, session_id: []const u8) ?[]const u8 {
-        const meta_path = std.fmt.allocPrint(self.a, "{s}/.cursor/acp-sessions/{s}/meta.json", .{ self.home, session_id }) catch return null;
-        const data = self.readAll(meta_path) orelse return null;
-        const v = json.parseFromSliceLeaky(json.Value, self.a, data, .{}) catch return null;
-        return stringField(v, "cwd");
+    const CursorInfo = struct {
+        project: []const u8 = "",
+        title: []const u8 = "",
+    };
+
+    fn cursorInfoForSession(self: *Scanner, session_id: []const u8) CursorInfo {
+        const meta_path = std.fmt.allocPrint(self.a, "{s}/.cursor/acp-sessions/{s}/meta.json", .{ self.home, session_id }) catch return .{};
+        const data = self.readAll(meta_path) orelse return .{};
+        const v = json.parseFromSliceLeaky(json.Value, self.a, data, .{}) catch return .{};
+        return .{ .project = stringField(v, "cwd") orelse "", .title = titleFromObject(v) orelse "" };
     }
 
     /// Parse Cursor Agent transcript JSONL from ~/.cursor/projects/*/agent-transcripts.
-    pub fn parseCursorTranscript(self: *Scanner, data: []const u8, project: []const u8, session_id: []const u8, ts: i64) void {
+    pub fn parseCursorTranscript(self: *Scanner, data: []const u8, project: []const u8, title: []const u8, session_id: []const u8, ts: i64) void {
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
             const v = self.parseLine(line) orelse continue;
@@ -523,7 +550,7 @@ pub const Scanner = struct {
             const content = fieldValue(msg, "content") orelse continue;
             const text = self.contentText(content) orelse continue;
             if (text.len == 0) continue;
-            self.add(.{ .agent = .cursor, .text = text, .project = project, .session = session_id, .ts = ts });
+            self.add(.{ .agent = .cursor, .title = title, .text = text, .project = project, .session = session_id, .ts = ts });
         }
     }
 
@@ -554,6 +581,7 @@ pub const Scanner = struct {
     const GrokInfo = struct {
         session: []const u8,
         project: []const u8 = "",
+        title: []const u8 = "",
         model: []const u8 = "",
         ts: i64 = 0,
     };
@@ -563,6 +591,7 @@ pub const Scanner = struct {
         var info = GrokInfo{
             .session = stringField(fieldValue(v, "info") orelse .{ .object = .empty }, "id") orelse stringField(v, "id") orelse fallback_session,
             .project = stringField(fieldValue(v, "info") orelse .{ .object = .empty }, "cwd") orelse stringField(v, "git_root_dir") orelse "",
+            .title = titleFromObject(v) orelse titleFromObject(fieldValue(v, "info") orelse .{ .object = .empty }) orelse "",
             .model = stringField(v, "current_model_id") orelse "",
         };
         if (stringField(v, "updated_at")) |updated| info.ts = parseIso8601Seconds(updated);
@@ -580,7 +609,7 @@ pub const Scanner = struct {
             const content = fieldValue(v, "content") orelse continue;
             const text = self.contentText(content) orelse continue;
             if (text.len == 0) continue;
-            self.add(.{ .agent = .grok, .text = text, .project = info.project, .session = info.session, .ts = info.ts, .meta = .{ .provider = "xai", .model = info.model } });
+            self.add(.{ .agent = .grok, .title = info.title, .text = text, .project = info.project, .session = info.session, .ts = info.ts, .meta = .{ .provider = "xai", .model = info.model } });
         }
     }
 
@@ -605,10 +634,58 @@ pub const Scanner = struct {
         return v.object.get(name);
     }
 
+    fn timestampFromObject(v: json.Value) i64 {
+        for ([_][]const u8{ "updated_at", "updatedAt", "timestamp", "created_at", "createdAt", "ts" }) |name| {
+            const ts = timestampValue(fieldValue(v, name) orelse continue);
+            if (ts > 0) return ts;
+        }
+        if (fieldValue(v, "time")) |time| {
+            const ts = timestampValue(time);
+            if (ts > 0) return ts;
+        }
+        return 0;
+    }
+
+    fn timestampValue(v: json.Value) i64 {
+        return switch (v) {
+            .integer => |n| normalizeTimestamp(n),
+            .float => |n| normalizeTimestamp(@intFromFloat(n)),
+            .string => |s| parseTimestampString(s),
+            .object => blk: {
+                for ([_][]const u8{ "updated", "updated_at", "updatedAt", "created", "created_at", "createdAt", "timestamp", "ts" }) |name| {
+                    const ts = timestampValue(fieldValue(v, name) orelse continue);
+                    if (ts > 0) break :blk ts;
+                }
+                break :blk 0;
+            },
+            else => 0,
+        };
+    }
+
+    fn normalizeTimestamp(n: i64) i64 {
+        if (n <= 0) return 0;
+        return if (n > 10_000_000_000) @divTrunc(n, 1000) else n;
+    }
+
+    fn parseTimestampString(s: []const u8) i64 {
+        if (s.len == 0) return 0;
+        if (std.fmt.parseInt(i64, s, 10)) |n| return normalizeTimestamp(n) else |_| {}
+        return parseIso8601Seconds(s);
+    }
+
     fn stringField(v: json.Value, name: []const u8) ?[]const u8 {
         const x = fieldValue(v, name) orelse return null;
         if (x != .string) return null;
         return x.string;
+    }
+
+    fn titleFromObject(v: json.Value) ?[]const u8 {
+        if (v != .object) return null;
+        for ([_][]const u8{ "title", "session_title", "sessionTitle", "name" }) |name| {
+            const title = stringField(v, name) orelse continue;
+            if (std.mem.trim(u8, title, " \t\r\n").len > 0) return title;
+        }
+        return null;
     }
 
     fn timestampSeconds(ts: Io.Timestamp) i64 {
@@ -643,11 +720,21 @@ pub const Scanner = struct {
         for (self.records.items[start..]) |*rec| rec.meta = meta;
     }
 
+    fn applyTitleToSessionRecords(self: *Scanner, start: usize, title: []const u8) void {
+        for (self.records.items[start..]) |*rec| rec.title = title;
+    }
+
     /// Parse a single pi session `.jsonl` file content.
     pub fn parsePiSession(self: *Scanner, data: []const u8) void {
+        self.parsePiSessionWithLastActive(data, 0);
+    }
+
+    fn parsePiSessionWithLastActive(self: *Scanner, data: []const u8, fallback_ts: i64) void {
         var cwd: []const u8 = "";
         var session_id: []const u8 = "";
+        var session_title: []const u8 = "";
         var meta: Meta = .{};
+        var session_ts = fallback_ts;
         const record_start = self.records.items.len;
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
@@ -665,16 +752,22 @@ pub const Scanner = struct {
             if (!keep) continue;
             const v = self.parseLine(line) orelse continue;
             if (v != .object) continue;
+            const line_ts = timestampFromObject(v);
             const o = v.object;
             const typ = o.get("type") orelse continue;
             if (typ != .string) continue;
             if (std.mem.eql(u8, typ.string, "session")) {
+                if (session_ts == 0 and line_ts > 0) session_ts = line_ts;
                 if (o.get("cwd")) |x| if (x == .string) {
                     cwd = x.string;
                 };
                 if (o.get("id")) |x| if (x == .string) {
                     session_id = x.string;
                 };
+                if (titleFromObject(v)) |title| {
+                    session_title = title;
+                    self.applyTitleToSessionRecords(record_start, session_title);
+                }
                 continue;
             }
             if (std.mem.eql(u8, typ.string, "model_change")) {
@@ -725,10 +818,11 @@ pub const Scanner = struct {
             if (text.len == 0) continue;
             self.add(.{
                 .agent = .pi,
+                .title = session_title,
                 .text = text,
                 .project = cwd,
                 .session = session_id,
-                .ts = 0,
+                .ts = if (session_ts > 0) session_ts else line_ts,
                 .meta = meta,
             });
         }
@@ -739,10 +833,12 @@ pub const Scanner = struct {
         "'role',json_extract(m.data,'$.role')," ++
         "'type',json_extract(p.data,'$.type')," ++
         "'text',json_extract(p.data,'$.text')," ++
+        "'title',null," ++
         "'provider',json_extract(m.data,'$.model.providerID')," ++
         "'model',json_extract(m.data,'$.model.modelID')," ++
         "'project',s.directory," ++
-        "'session',s.id) " ++
+        "'session',s.id," ++
+        "'ts',coalesce(json_extract(m.data,'$.time.updated'),json_extract(m.data,'$.time.created'),json_extract(m.data,'$.updated_at'),json_extract(m.data,'$.created_at'),json_extract(m.data,'$.updatedAt'),json_extract(m.data,'$.createdAt'),json_extract(m.data,'$.timestamp'))) " ++
         "FROM part p " ++
         "JOIN message m ON p.message_id=m.id " ++
         "JOIN session s ON p.session_id=s.id " ++
@@ -764,17 +860,22 @@ pub const Scanner = struct {
             break :blk true;
         };
         if (!exists) return;
+        const fallback_ts = if (Io.Dir.cwd().statFile(self.io, db_path, .{})) |stat| timestampSeconds(stat.mtime) else |_| 0;
         const argv = [_][]const u8{ "sqlite3", "-batch", "-noheader", db_path, opencode_query };
         const res = std.process.run(self.a, self.io, .{ .argv = &argv }) catch |err| {
             if (err == error.FileNotFound) self.sqlite_missing = true;
             return;
         };
         if (res.term != .exited or res.term.exited != 0) return;
-        self.parseOpencode(res.stdout);
+        self.parseOpencodeWithLastActive(res.stdout, fallback_ts);
     }
 
     /// Parse JSONL produced by `opencode_query` (one object per text part).
     pub fn parseOpencode(self: *Scanner, data: []const u8) void {
+        self.parseOpencodeWithLastActive(data, 0);
+    }
+
+    fn parseOpencodeWithLastActive(self: *Scanner, data: []const u8, fallback_ts: i64) void {
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
             const v = self.parseLine(line) orelse continue;
@@ -790,12 +891,14 @@ pub const Scanner = struct {
             const sess = if (o.get("session")) |x| (if (x == .string) x.string else "") else "";
             const provider = if (o.get("provider")) |x| (if (x == .string) x.string else "") else "";
             const model = if (o.get("model")) |x| (if (x == .string) x.string else "") else "";
+            const ts = timestampValue(o.get("ts") orelse .{ .integer = 0 });
             self.add(.{
                 .agent = .opencode,
+                .title = titleFromObject(v) orelse "",
                 .text = txt.string,
                 .project = proj,
                 .session = sess,
-                .ts = 0,
+                .ts = if (ts > 0) ts else fallback_ts,
                 .meta = .{ .provider = provider, .model = model },
             });
         }
@@ -858,10 +961,11 @@ test "codex cache round-trips records and rejects stale source metadata" {
     const records = [_]Record{
         .{
             .agent = .codex,
+            .title = "Cached title",
             .text = "cached user prompt",
             .project = "/work/proj",
             .session = "sess-1",
-            .ts = 0,
+            .ts = 1779186371,
             .meta = .{
                 .provider = "openai",
                 .model = "gpt-test",
@@ -877,9 +981,11 @@ test "codex cache round-trips records and rejects stale source metadata" {
     try testing.expectEqual(@as(usize, 1), reader_sc.records.items.len);
     const rec = reader_sc.records.items[0];
     try testing.expectEqual(Agent.codex, rec.agent);
+    try testing.expectEqualStrings("Cached title", rec.title);
     try testing.expectEqualStrings("cached user prompt", rec.text);
     try testing.expectEqualStrings("/work/proj", rec.project);
     try testing.expectEqualStrings("sess-1", rec.session);
+    try testing.expectEqual(@as(i64, 1779186371), rec.ts);
     try testing.expectEqualStrings("openai", rec.meta.provider);
     try testing.expectEqual(@as(u64, 30), rec.meta.usage.total);
     try testing.expectEqual(@as(f64, 12.5), rec.meta.usage.rate_percent);
@@ -896,12 +1002,27 @@ test "codex cache without footer rolls back appended records" {
     try sc.records.append(sc.a, .{ .agent = .claude, .text = "keep", .project = "", .session = "old", .ts = 1 });
     const stamp = SourceStamp{ .size_text = "100", .mtime_text = "200" };
     const data =
-        \\{"kind":"header","version":1,"source":"/source.jsonl","source_size":"100","source_mtime_ns":"200"}
-        \\{"kind":"record","text":"partial","project":"/p","session":"s","provider":"","model":"","thinking":"","plan":"","input":0,"output":0,"cache_read":0,"cache_write":0,"total":0,"context_window":0,"rate_percent":0,"cost":0}
+        \\{"kind":"header","version":3,"source":"/source.jsonl","source_size":"100","source_mtime_ns":"200"}
+        \\{"kind":"record","title":"Partial title","text":"partial","project":"/p","session":"s","ts":3,"provider":"","model":"","thinking":"","plan":"","input":0,"output":0,"cache_read":0,"cache_write":0,"total":0,"context_window":0,"rate_percent":0,"cost":0}
     ;
     try testing.expect(!sc.parseCodexCache(data, "/source.jsonl", stamp));
     try testing.expectEqual(@as(usize, 1), sc.records.items.len);
     try testing.expectEqualStrings("keep", sc.records.items[0].text);
+}
+
+test "codex session fallback timestamp becomes session last active time" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    const data =
+        \\{"type":"session_meta","payload":{"cwd":"/work/proj","id":"codex-session","title":"Codex session title"}}
+        \\{"type":"response_item","timestamp":"2026-06-07T07:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"text","text":"codex prompt"}]}}
+    ;
+    sc.parseCodexSessionWithLastActive(data, 1770001234);
+    try testing.expectEqual(@as(usize, 1), sc.records.items.len);
+    try testing.expectEqualStrings("Codex session title", sc.records.items[0].title);
+    try testing.expectEqualStrings("codex prompt", sc.records.items[0].text);
+    try testing.expectEqual(@as(i64, 1770001234), sc.records.items[0].ts);
 }
 
 test "parse pi session: only user messages, session id + cwd captured" {
@@ -909,7 +1030,7 @@ test "parse pi session: only user messages, session id + cwd captured" {
     defer arena.deinit();
     var sc = testScanner(arena.allocator());
     const data =
-        \\{"type":"session","version":3,"id":"019e-uuid","cwd":"/work/proj"}
+        \\{"type":"session","version":3,"id":"019e-uuid","cwd":"/work/proj","title":"Pi session title"}
         \\{"type":"model_change","modelId":"gpt"}
         \\{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hi there"}]}}
         \\{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}
@@ -918,10 +1039,24 @@ test "parse pi session: only user messages, session id + cwd captured" {
     sc.parsePiSession(data);
     try testing.expectEqual(@as(usize, 2), sc.records.items.len);
     try testing.expectEqualStrings("hi there", sc.records.items[0].text);
+    try testing.expectEqualStrings("Pi session title", sc.records.items[0].title);
     try testing.expectEqualStrings("/work/proj", sc.records.items[0].project);
     try testing.expectEqualStrings("019e-uuid", sc.records.items[0].session);
     try testing.expectEqualStrings("plain string content", sc.records.items[1].text);
     try testing.expectEqual(Agent.pi, sc.records.items[0].agent);
+}
+
+test "pi session fallback timestamp becomes session last active time" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    const data =
+        \\{"type":"session","version":3,"id":"019e-uuid","cwd":"/work/proj"}
+        \\{"type":"message","message":{"role":"user","content":"hi"}}
+    ;
+    sc.parsePiSessionWithLastActive(data, 1770004321);
+    try testing.expectEqual(@as(usize, 1), sc.records.items.len);
+    try testing.expectEqual(@as(i64, 1770004321), sc.records.items[0].ts);
 }
 
 test "parse opencode query output: user text parts only" {
@@ -929,16 +1064,18 @@ test "parse opencode query output: user text parts only" {
     defer arena.deinit();
     var sc = testScanner(arena.allocator());
     const data =
-        \\{"role":"user","type":"text","text":"opencode prompt","project":"/oc/proj","session":"oc1"}
+        \\{"role":"user","type":"text","title":"OpenCode title","text":"opencode prompt","project":"/oc/proj","session":"oc1","ts":"1770001111"}
         \\{"role":"assistant","type":"text","text":"assistant reply","project":"/oc/proj","session":"oc1"}
         \\{"role":"user","type":"text","text":"","project":"/oc/proj","session":"oc1"}
         \\{"role":"user","type":"reasoning","text":"thinking","project":"/oc/proj","session":"oc1"}
     ;
     sc.parseOpencode(data);
     try testing.expectEqual(@as(usize, 1), sc.records.items.len);
+    try testing.expectEqualStrings("OpenCode title", sc.records.items[0].title);
     try testing.expectEqualStrings("opencode prompt", sc.records.items[0].text);
     try testing.expectEqualStrings("/oc/proj", sc.records.items[0].project);
     try testing.expectEqualStrings("oc1", sc.records.items[0].session);
+    try testing.expectEqual(@as(i64, 1770001111), sc.records.items[0].ts);
     try testing.expectEqual(Agent.opencode, sc.records.items[0].agent);
 }
 
@@ -950,9 +1087,10 @@ test "parse cursor transcript: user message content only" {
         \\{"role":"user","message":{"content":[{"type":"text","text":"cursor prompt"},{"type":"tool_use","name":"ignored"}]}}
         \\{"role":"assistant","message":{"content":[{"type":"text","text":"assistant reply"}]}}
     ;
-    sc.parseCursorTranscript(data, "/work/cursor", "cursor-session", 1770000000);
+    sc.parseCursorTranscript(data, "/work/cursor", "Cursor session title", "cursor-session", 1770000000);
     try testing.expectEqual(@as(usize, 1), sc.records.items.len);
     try testing.expectEqual(Agent.cursor, sc.records.items[0].agent);
+    try testing.expectEqualStrings("Cursor session title", sc.records.items[0].title);
     try testing.expectEqualStrings("cursor prompt", sc.records.items[0].text);
     try testing.expectEqualStrings("/work/cursor", sc.records.items[0].project);
     try testing.expectEqualStrings("cursor-session", sc.records.items[0].session);
@@ -968,9 +1106,10 @@ test "parse grok chat history: user content with summary metadata" {
         \\{"type":"user","content":[{"type":"text","text":"grok prompt"}]}
         \\{"type":"assistant","content":"assistant reply"}
     ;
-    sc.parseGrokChatHistory(data, .{ .session = "grok-session", .project = "/work/grok", .model = "grok-test", .ts = 1770000001 });
+    sc.parseGrokChatHistory(data, .{ .session = "grok-session", .project = "/work/grok", .title = "Grok session title", .model = "grok-test", .ts = 1770000001 });
     try testing.expectEqual(@as(usize, 1), sc.records.items.len);
     try testing.expectEqual(Agent.grok, sc.records.items[0].agent);
+    try testing.expectEqualStrings("Grok session title", sc.records.items[0].title);
     try testing.expectEqualStrings("grok prompt", sc.records.items[0].text);
     try testing.expectEqualStrings("/work/grok", sc.records.items[0].project);
     try testing.expectEqualStrings("grok-session", sc.records.items[0].session);

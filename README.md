@@ -47,13 +47,13 @@ bash <(curl -L https://al3rez.com/zehn)
 
 It clones the repo, does a `ReleaseFast` build, and leaves the binary at `~/.local/bin/zehn`. If you don't already have [Zig 0.16+](https://ziglang.org/download/), it grabs it for you via `brew`/`pacman` when present, otherwise the official tarball from ziglang.org. Set `PREFIX` to install somewhere else (`PREFIX=/usr/local bash <(curl -L ...)`), or `NO_INSTALL_ZIG=1` to make it refuse rather than fetch Zig.
 
-Already installed? Run:
+Already installed? Run this when you want to update:
 
 ```sh
 zehn update
 ```
 
-zehn checks GitHub master when it starts. If your binary was built from an older commit, it prints a short "update available" note. Set `ZEHN_NO_UPDATE_CHECK=1` if you want it quiet.
+zehn does not check for updates automatically, so normal searches stay quiet and offline. The `zehn update` command checks GitHub master only when you run it.
 
 Prefer to do it by hand? You'll need [Zig 0.16](https://ziglang.org/download/) or newer.
 
@@ -87,7 +87,9 @@ zehn update      # update to the latest master build
 zehn --version
 ```
 
-Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit. Press `^t` for the agent picker, or `^r` for the project picker. The search box has the usual readline-ish editing: left/right, Ctrl-left/right, Ctrl-U, Ctrl-K, Ctrl-backspace, and Ctrl-delete.
+Results are grouped by last-active day by default, with the newest day first. Each result uses two lines: the source-provided session title first, then the matched prompt text. Press `^d` to toggle day grouping on or off. In grouped mode, left/right jumps to the first session in the previous/next day group.
+
+Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit. Press `^t` for the agent picker, or `^r` for the project picker. The search box has the usual readline-ish editing when day grouping is off: left/right, Ctrl-left/right, Ctrl-U, Ctrl-K, Ctrl-backspace, and Ctrl-delete.
 
 Long prompts are a thing, especially if you use `/skill` blocks. Press Tab to focus the preview, PageUp/PageDown to scroll it, left/right to horizontally scroll the selected result, Ctrl-right/Ctrl-left to jump that result to the end/start, `W` to toggle wrapping, and `F` for a larger preview.
 
@@ -118,12 +120,12 @@ flags Ghostex uses: `codex --yolo`, `claude --dangerously-skip-permissions`,
 `opencode --dangerously-skip-permissions`, `cursor-agent --yolo`, and
 `grok --permission-mode bypassPermissions`. `pi` has no Accept All flag.
 
-Each agent shows up in its own brand color, so you can tell at a glance whether a result came from claude or codex. Duplicate prompts collapse into one (keeping the most recent), and when two results score the same, the newer one wins.
+Each agent shows up in its own brand color, and each result shows a compact last-active time, so you can tell at a glance whether a result came from claude or codex and when that session was last active. Duplicate prompts collapse into one (keeping the most recent). Fuzzy search still leads ranking, but near-equivalent matches prefer newer sessions so a tiny score difference does not bury recent work.
 
 opencode keeps its history in a SQLite database, so reading it needs the `sqlite3` CLI on your `PATH`. If it is missing, zehn skips opencode and says so instead of failing.
 
 Codex session files can get large. zehn keeps a derived cache of extracted Codex
-user prompts in `~/.ghostex/zehn/codex-sessions-v1`, invalidated by each source
+user prompts in `~/.ghostex/zehn/codex-sessions-v3`, invalidated by each source
 file's size and modified time. The original session files remain the source of
 truth, and the cache can be deleted at any time.
 

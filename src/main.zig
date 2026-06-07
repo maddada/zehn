@@ -88,7 +88,8 @@ pub fn main(init: std.process.Init) !void {
                 \\(run from the session's project directory)
                 \\
                 \\Keys: type to filter · ↑/↓ or ^p/^n move · Enter resume
-                \\      ^t agents · ^r projects · ^f favorite · ^e view · ^y copy · ^o fork
+                \\      ^d day grouping · ←/→ next day · ^t agents · ^r projects
+                \\      ^f favorite · ^e view · ^y copy · ^o fork
                 \\      Esc/^c quit
                 \\
                 \\Favorites are stored in $XDG_CONFIG_HOME/zehn/favorites (or ~/.config/zehn).
@@ -104,7 +105,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    try checkForUpdate(init, w);
+    // CDXC:ZehnUpdateNotification 2026-06-07-08:12:
+    // Zehn must never show an automatic update notification during normal search startup. Keep updates explicit through `zehn update` so launches stay quiet and offline unless the user asks to update.
 
     var sc = scan.Scanner.init(a, io, home);
     sc.scanAll();
@@ -215,20 +217,6 @@ fn shortRev(rev: []const u8) []const u8 {
 
 fn remoteMasterCommand() []const u8 {
     return "curl -fsSL --max-time 2 https://api.github.com/repos/al3rez/zehn/commits/master 2>/dev/null | sed -n 's/.*\"sha\": *\"\\([0-9a-f]*\\)\".*/\\1/p' | head -n1";
-}
-
-fn checkForUpdate(init: std.process.Init, w: *Io.Writer) !void {
-    _ = w;
-    if (std.mem.eql(u8, git_rev, "unknown")) return;
-    if (init.environ_map.get("ZEHN_NO_UPDATE_CHECK") != null) return;
-    const cmd = try std.fmt.allocPrint(init.arena.allocator(),
-        \\remote=$({s})
-        \\if [ -n "$remote" ] && [ "$remote" != "{s}" ]; then
-        \\  printf '\033[33mzehn: update available. Run `zehn update` to install latest master.\033[0m\n' >&2
-        \\fi
-    , .{ remoteMasterCommand(), git_rev });
-    var child = std.process.spawn(init.io, .{ .argv = &.{ "sh", "-c", cmd }, .stdout = .ignore, .stderr = .inherit, .environ_map = init.environ_map }) catch return;
-    _ = child.wait(init.io) catch return;
 }
 
 /// Re-run the official installer. It builds from the latest master and replaces

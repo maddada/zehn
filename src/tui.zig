@@ -81,6 +81,14 @@ const Hit = struct {
     m: fuzzy.Match,
 };
 
+const ViewRow = union(enum) {
+    day: i64,
+    hit: usize,
+};
+
+const seconds_per_day: i64 = 86_400;
+const unknown_day_key: i64 = std.math.minInt(i64);
+
 // Official brand colors as 24-bit truecolor.
 fn agentColor(a: scan.Agent) []const u8 {
     return switch (a) {
@@ -100,6 +108,7 @@ pub const Tui = struct {
     query: std.ArrayList(u8) = .empty,
     query_cursor: usize = 0,
     hits: std.ArrayList(Hit) = .empty,
+    view_rows: std.ArrayList(ViewRow) = .empty,
     sel: usize = 0,
     top: usize = 0,
     preview_scroll: usize = 0,
@@ -107,6 +116,9 @@ pub const Tui = struct {
     preview_focus: bool = false,
     wrap_preview: bool = true,
     fullscreen_preview: bool = false,
+    // CDXC:AgentHistorySearch 2026-06-07-08:27:
+    // Search results should default to day-grouped browsing so users can see when sessions were last active. Ctrl-D toggles the grouping, and plain left/right jump to the first session in adjacent day groups while grouped.
+    group_by_day: bool = true,
     /// Bit mask of selected agents in the interactive picker. 0 means no
     /// filter, so all agents are shown.
     agent_filter_mask: u8 = 0,
@@ -184,22 +196,66 @@ pub const Tui = struct {
                 self.hits.append(self.a, .{ .idx = @intCast(i), .score = m.score, .fav = is_fav, .m = m }) catch oom();
             }
         }
-        std.mem.sort(Hit, self.hits.items, self.records, struct {
-            fn lt(recs: []const scan.Record, x: Hit, y: Hit) bool {
-                // Favorites form a strict tier above the rest (see favorites.rank).
-                const rx = favorites.rank(x.score, x.fav);
-                const ry = favorites.rank(y.score, y.fav);
-                if (rx != ry) return rx > ry;
-                const tx = recs[x.idx].ts;
-                const ty = recs[y.idx].ts;
-                if (tx != ty) return tx > ty; // newer first
-                return x.idx < y.idx;
-            }
-        }.lt);
+        std.mem.sort(Hit, self.hits.items, SortContext{ .records = self.records, .query_empty = q.len == 0, .group_by_day = self.group_by_day }, hitLess);
+        self.rebuildViewRows();
         self.sel = 0;
         self.top = 0;
         self.preview_scroll = 0;
         self.result_scroll = 0;
+    }
+
+    const SortContext = struct {
+        records: []const scan.Record,
+        query_empty: bool,
+        group_by_day: bool,
+    };
+
+    fn hitLess(ctx: SortContext, x: Hit, y: Hit) bool {
+        const tx = ctx.records[x.idx].ts;
+        const ty = ctx.records[y.idx].ts;
+        if (ctx.group_by_day) {
+            const dx = dayKey(tx);
+            const dy = dayKey(ty);
+            if (dx != dy) return dx > dy;
+        }
+        if (x.fav != y.fav) return x.fav;
+        if (ctx.query_empty) {
+            if (tx != ty) return tx > ty;
+            if (x.score != y.score) return x.score > y.score;
+            return x.idx < y.idx;
+        }
+        const bx = scoreBucket(x.score);
+        const by = scoreBucket(y.score);
+        if (bx != by) return bx > by;
+        if (tx != ty) return tx > ty;
+        if (x.score != y.score) return x.score > y.score;
+        return x.idx < y.idx;
+    }
+
+    fn scoreBucket(score: i32) i32 {
+        return @divFloor(score, 32);
+    }
+
+    fn dayKey(ts: i64) i64 {
+        if (ts <= 0) return unknown_day_key;
+        return @divFloor(ts, seconds_per_day);
+    }
+
+    fn rebuildViewRows(self: *Tui) void {
+        self.view_rows.clearRetainingCapacity();
+        if (!self.group_by_day) {
+            for (self.hits.items, 0..) |_, i| self.view_rows.append(self.a, .{ .hit = i }) catch oom();
+            return;
+        }
+        var last_day: ?i64 = null;
+        for (self.hits.items, 0..) |hit, i| {
+            const d = dayKey(self.records[hit.idx].ts);
+            if (last_day == null or last_day.? != d) {
+                self.view_rows.append(self.a, .{ .day = d }) catch oom();
+                last_day = d;
+            }
+            self.view_rows.append(self.a, .{ .hit = i }) catch oom();
+        }
     }
 
     fn bottomPaneHeight(self: *const Tui) usize {
@@ -223,10 +279,56 @@ pub const Tui = struct {
         return self.rows -| (1 + list_height + 1);
     }
 
+    fn selectedViewRow(self: *const Tui) usize {
+        for (self.view_rows.items, 0..) |row, i| {
+            switch (row) {
+                .hit => |hit_idx| if (hit_idx == self.sel) return i,
+                .day => {},
+            }
+        }
+        return 0;
+    }
+
+    fn viewRowHeight(row: ViewRow) usize {
+        return switch (row) {
+            .day => 1,
+            .hit => 2,
+        };
+    }
+
+    fn visualOffsetForViewRow(self: *const Tui, target: usize) usize {
+        var offset: usize = 0;
+        var i: usize = 0;
+        while (i < target and i < self.view_rows.items.len) : (i += 1) {
+            offset += viewRowHeight(self.view_rows.items[i]);
+        }
+        return offset;
+    }
+
     fn clampScroll(self: *Tui) void {
         const h = self.listHeight();
-        if (self.sel < self.top) self.top = self.sel;
-        if (self.sel >= self.top + h) self.top = self.sel + 1 - h;
+        if (self.view_rows.items.len == 0) {
+            self.top = 0;
+            return;
+        }
+        const selected_row = self.selectedViewRow();
+        if (self.top >= self.view_rows.items.len) self.top = self.view_rows.items.len - 1;
+        const selected_offset = self.visualOffsetForViewRow(selected_row);
+        const selected_height = viewRowHeight(self.view_rows.items[selected_row]);
+        const top_offset = self.visualOffsetForViewRow(self.top);
+        if (selected_offset < top_offset) {
+            self.top = selected_row;
+            return;
+        }
+        if (selected_offset + selected_height <= top_offset + h) return;
+        self.top = selected_row;
+        var visible = selected_height;
+        while (self.top > 0) {
+            const prev_height = viewRowHeight(self.view_rows.items[self.top - 1]);
+            if (visible + prev_height > h) break;
+            self.top -= 1;
+            visible += prev_height;
+        }
     }
 
     // Render `text` on a single line: UTF-8 aware, truncated to `max` display
@@ -270,6 +372,144 @@ pub const Tui = struct {
         }
     }
 
+    fn writeDayHeaderRow(self: *Tui, b: *std.ArrayList(u8), day: i64, now: i64) void {
+        var label_buf: [32]u8 = undefined;
+        const label = formatDayHeader(&label_buf, day, now);
+        b.print(self.a, "  \x1b[1;90m{s}\x1b[0m\r\n", .{label}) catch oom();
+    }
+
+    fn writeResultRow(self: *Tui, b: *std.ArrayList(u8), hit_idx: usize, text_max: usize, now: i64, max_lines: usize) usize {
+        if (max_lines == 0) return 0;
+        const hit = self.hits.items[hit_idx];
+        const rec = self.records[hit.idx];
+        const selected = hit_idx == self.sel;
+        if (selected) {
+            b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
+            b.appendSlice(self.a, "▌\x1b[0m\x1b[7m ") catch oom();
+        } else {
+            b.appendSlice(self.a, "  ") catch oom();
+        }
+        if (hit.fav) {
+            if (selected) {
+                b.appendSlice(self.a, "★") catch oom();
+            } else {
+                b.appendSlice(self.a, "\x1b[1;33m★\x1b[0m") catch oom();
+            }
+            if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
+        } else {
+            b.append(self.a, ' ') catch oom();
+        }
+        b.append(self.a, ' ') catch oom();
+
+        if (!selected) b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
+        var agent_buf: [16]u8 = undefined;
+        const agent = std.fmt.bufPrint(&agent_buf, "{s: <7}", .{rec.agent.label()}) catch rec.agent.label();
+        b.appendSlice(self.a, agent) catch oom();
+        if (!selected) b.appendSlice(self.a, "\x1b[0m") catch oom();
+        if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
+
+        var compact_buf: [16]u8 = undefined;
+        var time_buf: [16]u8 = undefined;
+        const compact = formatLastActiveCompact(&compact_buf, rec.ts, now);
+        const time_label = std.fmt.bufPrint(&time_buf, "{s: >7}", .{compact}) catch compact;
+        b.append(self.a, ' ') catch oom();
+        if (!selected) b.appendSlice(self.a, "\x1b[90m") catch oom();
+        b.appendSlice(self.a, time_label) catch oom();
+        if (!selected) b.appendSlice(self.a, "\x1b[0m") catch oom();
+        if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
+
+        b.append(self.a, ' ') catch oom();
+        if (selected) b.appendSlice(self.a, "\x1b[1m") catch oom();
+        self.appendPlainTruncated(b, sessionTitle(rec), text_max);
+        b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+        if (max_lines == 1) return 1;
+
+        if (selected) {
+            b.appendSlice(self.a, "\x1b[7m    ") catch oom();
+        } else {
+            b.appendSlice(self.a, "    ") catch oom();
+        }
+        b.appendSlice(self.a, "\x1b[90m") catch oom();
+        b.appendSlice(self.a, "prompt ") catch oom();
+        b.appendSlice(self.a, "\x1b[0m") catch oom();
+        if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
+        self.writeHighlighted(b, rec.text, hit.m, text_max, selected);
+        b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+        return 2;
+    }
+
+    fn sessionTitle(rec: scan.Record) []const u8 {
+        if (rec.title.len > 0) return rec.title;
+        if (rec.session.len > 0) return rec.session;
+        return "Untitled session";
+    }
+
+    fn formatLastActiveCompact(buf: *[16]u8, ts: i64, now: i64) []const u8 {
+        if (ts <= 0) return "unknown";
+        var delta = now - ts;
+        if (delta < 0) delta = 0;
+        if (delta < 60) return "now";
+        if (delta < 3_600) return std.fmt.bufPrint(buf, "{d}m", .{@divTrunc(delta, 60)}) catch "now";
+        if (delta < seconds_per_day) return std.fmt.bufPrint(buf, "{d}h", .{@divTrunc(delta, 3_600)}) catch "now";
+        if (delta < 7 * seconds_per_day) return std.fmt.bufPrint(buf, "{d}d", .{@divTrunc(delta, seconds_per_day)}) catch "now";
+        const date = civilFromDayKey(dayKey(ts));
+        return std.fmt.bufPrint(buf, "{s} {d}", .{ monthName(date.month), date.day }) catch "unknown";
+    }
+
+    fn nowSeconds(self: *Tui) i64 {
+        return @intCast(@divTrunc(Io.Clock.real.now(self.io).nanoseconds, 1_000_000_000));
+    }
+
+    fn formatDayHeader(buf: *[32]u8, day: i64, now: i64) []const u8 {
+        if (day == unknown_day_key) return "Unknown day";
+        const today = dayKey(now);
+        if (day == today) return "Today";
+        if (day == today - 1) return "Yesterday";
+        if (day > today - 7 and day < today) return std.fmt.bufPrint(buf, "{d} days ago", .{today - day}) catch "Recent";
+        const date = civilFromDayKey(day);
+        const now_date = civilFromDayKey(today);
+        if (date.year == now_date.year) return std.fmt.bufPrint(buf, "{s} {d}", .{ monthName(date.month), date.day }) catch "Older";
+        return std.fmt.bufPrint(buf, "{s} {d}, {d}", .{ monthName(date.month), date.day, date.year }) catch "Older";
+    }
+
+    const CivilDate = struct {
+        year: i64,
+        month: u8,
+        day: u8,
+    };
+
+    fn civilFromDayKey(day: i64) CivilDate {
+        const z = day + 719_468;
+        const era = @divFloor(z, 146_097);
+        const doe = z - era * 146_097;
+        const yoe = @divFloor(doe - @divFloor(doe, 1_460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+        var y = yoe + era * 400;
+        const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+        const mp = @divFloor(5 * doy + 2, 153);
+        const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+        const m = mp + if (mp < 10) @as(i64, 3) else @as(i64, -9);
+        if (m <= 2) y += 1;
+        return .{ .year = y, .month = @intCast(m), .day = @intCast(d) };
+    }
+
+    fn monthName(month: u8) []const u8 {
+        return switch (month) {
+            1 => "Jan",
+            2 => "Feb",
+            3 => "Mar",
+            4 => "Apr",
+            5 => "May",
+            6 => "Jun",
+            7 => "Jul",
+            8 => "Aug",
+            9 => "Sep",
+            10 => "Oct",
+            11 => "Nov",
+            12 => "Dec",
+            else => "???",
+        };
+    }
+
     // Write the assembled frame, dropping a single trailing newline first. The
     // frame is sized to fill the terminal exactly, so a final CRLF would push
     // the cursor one row below the bottom and scroll the whole alt screen up —
@@ -295,46 +535,26 @@ pub const Tui = struct {
         self.writePromptLine(b);
 
         const h = self.listHeight();
-        const text_max: usize = if (self.cols > 16) self.cols - 16 else 20;
+        const now = self.nowSeconds();
+        const text_max: usize = if (self.cols > 24) self.cols - 24 else 20;
         var row: usize = 0;
-        while (row < h) : (row += 1) {
-            const hi = self.top + row;
-            if (hi >= self.hits.items.len) {
+        var row_idx = self.top;
+        while (row < h) {
+            if (row_idx >= self.view_rows.items.len) {
                 b.appendSlice(self.a, "\r\n") catch oom();
+                row += 1;
                 continue;
             }
-            const hit = self.hits.items[hi];
-            const rec = self.records[hit.idx];
-            const selected = hi == self.sel;
-            if (selected) {
-                b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
-                b.appendSlice(self.a, "▌\x1b[0m\x1b[7m ") catch oom();
-            } else {
-                b.appendSlice(self.a, "  ") catch oom();
+            switch (self.view_rows.items[row_idx]) {
+                .day => |day| {
+                    self.writeDayHeaderRow(b, day, now);
+                    row += 1;
+                },
+                .hit => |hit_idx| {
+                    row += self.writeResultRow(b, hit_idx, text_max, now, h - row);
+                },
             }
-            // favorite marker (bold yellow star), or a blank to keep columns aligned
-            if (hit.fav) {
-                if (selected) {
-                    b.appendSlice(self.a, "★") catch oom();
-                } else {
-                    b.appendSlice(self.a, "\x1b[1;33m★\x1b[0m") catch oom();
-                }
-                if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
-            } else {
-                b.append(self.a, ' ') catch oom();
-            }
-            b.append(self.a, ' ') catch oom();
-            // Agent colors look muddy under reverse-video selection in several
-            // terminals, so selected rows keep one plain inverted style.
-            if (!selected) b.appendSlice(self.a, agentColor(rec.agent)) catch oom();
-            var tag: [16]u8 = undefined;
-            const ts = std.fmt.bufPrint(&tag, "{s: <7}", .{rec.agent.label()}) catch rec.agent.label();
-            b.appendSlice(self.a, ts) catch oom();
-            if (!selected) b.appendSlice(self.a, "\x1b[0m") catch oom();
-            if (selected) b.appendSlice(self.a, "\x1b[7m") catch oom();
-            b.append(self.a, ' ') catch oom();
-            self.writeHighlighted(b, rec.text, hit.m, text_max, selected);
-            b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+            row_idx += 1;
         }
 
         b.appendSlice(self.a, "\x1b[90m") catch oom();
@@ -551,6 +771,7 @@ pub const Tui = struct {
                 }
                 switch (c) {
                     3 => return null, // ctrl-c
+                    4 => self.toggleDayGrouping(), // ctrl-d
                     13, 10 => {
                         if (self.sel < self.hits.items.len)
                             return .{ .idx = self.hits.items[self.sel].idx, .kind = .resume_session };
@@ -616,6 +837,53 @@ pub const Tui = struct {
         }
     }
 
+    fn toggleDayGrouping(self: *Tui) void {
+        const rec_idx: ?u32 = if (self.sel < self.hits.items.len) self.hits.items[self.sel].idx else null;
+        self.group_by_day = !self.group_by_day;
+        self.recompute();
+        if (rec_idx) |idx| self.selectRecord(idx);
+    }
+
+    fn selectRecord(self: *Tui, rec_idx: u32) void {
+        for (self.hits.items, 0..) |hit, i| {
+            if (hit.idx == rec_idx) {
+                self.selectHit(i);
+                return;
+            }
+        }
+    }
+
+    fn selectHit(self: *Tui, hit_idx: usize) void {
+        if (hit_idx >= self.hits.items.len) return;
+        self.sel = hit_idx;
+        self.preview_scroll = 0;
+        self.result_scroll = 0;
+    }
+
+    fn jumpDay(self: *Tui, delta: isize) void {
+        if (self.hits.items.len == 0 or self.sel >= self.hits.items.len) return;
+        const current_day = dayKey(self.records[self.hits.items[self.sel].idx].ts);
+        if (delta > 0) {
+            var i = self.sel + 1;
+            while (i < self.hits.items.len) : (i += 1) {
+                if (dayKey(self.records[self.hits.items[i].idx].ts) != current_day) {
+                    self.selectHit(i);
+                    return;
+                }
+            }
+            return;
+        }
+        var i = self.sel;
+        while (i > 0) {
+            i -= 1;
+            const candidate_day = dayKey(self.records[self.hits.items[i].idx].ts);
+            if (candidate_day == current_day) continue;
+            while (i > 0 and dayKey(self.records[self.hits.items[i - 1].idx].ts) == candidate_day) i -= 1;
+            self.selectHit(i);
+            return;
+        }
+    }
+
     fn handleEscapeSequence(self: *Tui, bytes: []const u8) ?usize {
         if (bytes.len < 3 or bytes[0] != 27 or bytes[1] != '[') return null;
         if (bytes[2] == '5' and bytes.len >= 4 and bytes[3] == '~') {
@@ -653,8 +921,8 @@ pub const Tui = struct {
         switch (bytes[2]) {
             'A' => if (self.filtering_project) self.moveProjectSelection(-1) else if (self.filtering_agent) self.moveFilterSelection(-1) else self.moveUp(),
             'B' => if (self.filtering_project) self.moveProjectSelection(1) else if (self.filtering_agent) self.moveFilterSelection(1) else self.moveDown(),
-            'C' => if (self.preview_focus) self.scrollResult(8) else self.moveRight(),
-            'D' => if (self.preview_focus) self.scrollResult(-8) else self.moveLeft(),
+            'C' => if (self.preview_focus) self.scrollResult(8) else if (self.group_by_day) self.jumpDay(1) else self.moveRight(),
+            'D' => if (self.preview_focus) self.scrollResult(-8) else if (self.group_by_day) self.jumpDay(-1) else self.moveLeft(),
             else => {},
         }
         return 3;
@@ -663,9 +931,9 @@ pub const Tui = struct {
     fn writePromptLine(self: *Tui, b: *std.ArrayList(u8)) void {
         const prefix_cols: usize = 2;
         const status_cols: usize = if (self.cols >= 96)
-            2 + countDigits(self.hits.items.len) + 1 + countDigits(self.records.len) + 62
+            2 + countDigits(self.hits.items.len) + 1 + countDigits(self.records.len) + 72
         else if (self.cols >= 64)
-            2 + countDigits(self.hits.items.len) + 1 + countDigits(self.records.len) + 22
+            2 + countDigits(self.hits.items.len) + 1 + countDigits(self.records.len) + 25
         else
             2 + countDigits(self.hits.items.len) + 1 + countDigits(self.records.len);
         // Keep one column spare before CRLF. Many terminals auto-wrap as soon as
@@ -677,9 +945,9 @@ pub const Tui = struct {
         b.appendSlice(self.a, "\x1b[1;36m❯ \x1b[0m") catch oom();
         self.writeQueryWithCursor(b, query_max);
         if (self.cols >= 96) {
-            b.print(self.a, "  \x1b[90m{d}/{d}  ·  ^t agents  ^r projects  ^f fav  ^e view  ^y copy  ^o fork\x1b[0m", .{ self.hits.items.len, self.records.len }) catch oom();
+            b.print(self.a, "  \x1b[90m{d}/{d}  ·  ^d days  ^t agents  ^r projects  ^f fav  ^e view  ^y copy  ^o fork\x1b[0m", .{ self.hits.items.len, self.records.len }) catch oom();
         } else if (self.cols >= 64) {
-            b.print(self.a, "  \x1b[90m{d}/{d}  ·  ^t ^r ^f ^e ^y ^o\x1b[0m", .{ self.hits.items.len, self.records.len }) catch oom();
+            b.print(self.a, "  \x1b[90m{d}/{d}  ·  ^d ^t ^r ^f ^e ^y ^o\x1b[0m", .{ self.hits.items.len, self.records.len }) catch oom();
         } else {
             b.print(self.a, "  \x1b[90m{d}/{d}\x1b[0m", .{ self.hits.items.len, self.records.len }) catch oom();
         }
@@ -753,6 +1021,8 @@ pub const Tui = struct {
 
     fn writeMetadataLine(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record) void {
         b.appendSlice(self.a, "\x1b[90m") catch oom();
+        var active_buf: [48]u8 = undefined;
+        b.print(self.a, "{s} ", .{formatLastActiveFull(&active_buf, rec.ts)}) catch oom();
         self.writeUsageStatus(b, rec.meta.usage);
         if (rec.meta.plan.len > 0) b.print(self.a, "({s}) ", .{rec.meta.plan}) catch oom();
         if (rec.meta.usage.rate_percent > 0) b.print(self.a, "{d:.1}%", .{rec.meta.usage.rate_percent}) catch oom();
@@ -764,6 +1034,16 @@ pub const Tui = struct {
         }
         if (rec.meta.thinking.len > 0) b.print(self.a, " • {s}", .{rec.meta.thinking}) catch oom();
         b.appendSlice(self.a, "\x1b[0m\r\n") catch oom();
+    }
+
+    fn formatLastActiveFull(buf: *[48]u8, ts: i64) []const u8 {
+        if (ts <= 0) return "last active unknown";
+        const day = dayKey(ts);
+        const date = civilFromDayKey(day);
+        const seconds = @mod(ts, seconds_per_day);
+        const hour = @divTrunc(seconds, 3_600);
+        const minute = @divTrunc(@mod(seconds, 3_600), 60);
+        return std.fmt.bufPrint(buf, "last active {s} {d} {d:0>2}:{d:0>2} UTC", .{ monthName(date.month), date.day, hour, minute }) catch "last active known";
     }
 
     fn gitBranch(self: *Tui, project: []const u8) ?[]const u8 {
@@ -1284,6 +1564,7 @@ test "selection changes reset preview and result scroll" {
     };
     var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
     defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
     tui.recompute();
     tui.preview_scroll = 3;
     tui.result_scroll = 9;
@@ -1292,6 +1573,94 @@ test "selection changes reset preview and result scroll" {
 
     try testing.expectEqual(@as(usize, 0), tui.preview_scroll);
     try testing.expectEqual(@as(usize, 0), tui.result_scroll);
+}
+
+test "default results are grouped by last-active day" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const day_old = 20_000 * seconds_per_day;
+    const day_new = 20_001 * seconds_per_day;
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "old", .text = "same", .ts = day_old + 100 },
+        .{ .agent = .codex, .project = "p", .session = "newer", .text = "same", .ts = day_new + 100 },
+        .{ .agent = .pi, .project = "p", .session = "newest", .text = "same", .ts = day_new + 200 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+
+    tui.recompute();
+
+    try testing.expect(tui.group_by_day);
+    try testing.expectEqual(@as(usize, 5), tui.view_rows.items.len);
+    try testing.expectEqual(Tui.dayKey(day_new), tui.view_rows.items[0].day);
+    try testing.expectEqual(@as(u32, 2), tui.hits.items[tui.view_rows.items[1].hit].idx);
+    try testing.expectEqual(@as(u32, 1), tui.hits.items[tui.view_rows.items[2].hit].idx);
+    try testing.expectEqual(Tui.dayKey(day_old), tui.view_rows.items[3].day);
+}
+
+test "grouped left and right arrows jump to adjacent day starts" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const day_a = 20_000 * seconds_per_day;
+    const day_b = 20_001 * seconds_per_day;
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "a", .text = "same", .ts = day_a + 1 },
+        .{ .agent = .claude, .project = "p", .session = "b1", .text = "same", .ts = day_b + 20 },
+        .{ .agent = .claude, .project = "p", .session = "b2", .text = "same", .ts = day_b + 10 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+    tui.recompute();
+    tui.sel = 1;
+
+    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[C"));
+    try testing.expectEqual(@as(u32, 0), tui.hits.items[tui.sel].idx);
+
+    try testing.expectEqual(@as(?usize, 3), tui.handleEscapeSequence("\x1b[D"));
+    try testing.expectEqual(@as(u32, 1), tui.hits.items[tui.sel].idx);
+}
+
+test "flat result row still shows compact last-active time" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .title = "Session title", .project = "p", .session = "s", .text = "recent prompt", .ts = 1_800 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+    tui.group_by_day = false;
+    tui.recompute();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), tui.writeResultRow(&out, 0, 40, 3_600, 2));
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "30m") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "Session title") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "recent prompt") != null);
+}
+
+test "result row title falls back to session id" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "session-123", .text = "prompt text", .ts = 1_800 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+    tui.group_by_day = false;
+    tui.recompute();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    _ = tui.writeResultRow(&out, 0, 40, 3_600, 2);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "session-123") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "prompt text") != null);
 }
 
 test "interactive agent filter picker filters hits" {
@@ -1303,6 +1672,7 @@ test "interactive agent filter picker filters hits" {
     };
     var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
     defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
     tui.recompute();
     try testing.expectEqual(@as(usize, 2), tui.hits.items.len);
     try testing.expectEqual(@as(u8, 0), tui.agent_filter_mask);
