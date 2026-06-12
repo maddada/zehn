@@ -140,9 +140,9 @@ pub const Tui = struct {
     // CDXC:AgentHistorySearch 2026-06-07-11:27:
     // Result rows should be prompt-first two-line entries: agent and matched prompt on line one, last-active time under the agent, and the gray session title/id starting under the prompt text on line two. Selected rows use gold text on a silver background across both lines, and blank spacer rows separate entries.
     group_by_day: bool = true,
-    // CDXC:AgentHistorySearch 2026-06-07-12:24:
-    // The result list is mouse-addressable: hovering a session selects it, and a left-click on a session returns the same resume action as Enter. Use SGR mouse coordinates and the rendered view-row model so grouped day headers and spacer rows map predictably.
-    mouse_resume_requested: bool = false,
+    // CDXC:AgentHistorySearch 2026-06-11-10:02:
+    // Search result second rows must append ` • <Project Name>` after the session title/id and show `No project` when project metadata is unknown.
+    // Mouse hover and clicks must not select or resume a result; Enter is the only resume action, while wheel input may still move the current keyboard selection.
     /// Bit mask of selected agents in the interactive picker. 0 means no
     /// filter, so all agents are shown.
     agent_filter_mask: u8 = 0,
@@ -214,7 +214,7 @@ pub const Tui = struct {
         const q = self.query.items;
         for (self.records, 0..) |rec, i| {
             if (!self.agentAllowed(rec.agent)) continue;
-            if (self.project_filter) |p| if (!std.mem.eql(u8, rec.project, p)) continue;
+            if (self.project_filter) |p| if (!self.recordMatchesProject(rec, p)) continue;
             if (self.matcher.match(q, rec.text)) |m| {
                 const is_fav = self.fav.contains(favorites.key(rec.agent.label(), rec.text));
                 self.hits.append(self.a, .{ .idx = @intCast(i), .score = m.score, .fav = is_fav, .m = m }) catch oom();
@@ -452,7 +452,7 @@ pub const Tui = struct {
         b.appendSlice(self.a, time_label) catch oom();
         if (!selected) b.appendSlice(self.a, reset_style) catch oom();
         b.append(self.a, ' ') catch oom();
-        self.writeInlineSessionTitle(b, rec, selected);
+        self.writeInlineSessionSummary(b, rec, selected);
         self.finishResultLine(b, selected);
         if (max_lines == 2) return 2;
 
@@ -486,10 +486,16 @@ pub const Tui = struct {
         b.appendSlice(self.a, "\r\n") catch oom();
     }
 
-    fn writeInlineSessionTitle(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record, selected: bool) void {
+    fn writeInlineSessionSummary(self: *Tui, b: *std.ArrayList(u8), rec: scan.Record, selected: bool) void {
         const title = sessionTitle(rec);
+        const project = projectDisplayName(rec.project);
+        var summary: std.ArrayList(u8) = .empty;
+        defer summary.deinit(self.a);
+        summary.appendSlice(self.a, title) catch oom();
+        summary.appendSlice(self.a, " • ") catch oom();
+        summary.appendSlice(self.a, project) catch oom();
         if (!selected) b.appendSlice(self.a, muted_result_style) catch oom();
-        self.appendPlainTruncated(b, title, self.resultPromptCols());
+        self.appendPlainTruncated(b, summary.items, self.resultPromptCols());
         if (!selected) b.appendSlice(self.a, reset_style) catch oom();
     }
 
@@ -497,6 +503,15 @@ pub const Tui = struct {
         if (rec.title.len > 0) return rec.title;
         if (rec.session.len > 0) return rec.session;
         return "Untitled session";
+    }
+
+    fn projectDisplayName(project: []const u8) []const u8 {
+        if (project.len == 0) return "No project";
+        var end = project.len;
+        while (end > 1 and (project[end - 1] == '/' or project[end - 1] == '\\')) end -= 1;
+        const trimmed = project[0..end];
+        const base = std.fs.path.basename(trimmed);
+        return if (base.len > 0) base else trimmed;
     }
 
     fn resultLineCols(self: *const Tui) usize {
@@ -831,7 +846,6 @@ pub const Tui = struct {
                 if (c == 27) {
                     if (self.handleEscapeSequence(ibuf[i..n])) |consumed| {
                         i += consumed;
-                        if (self.takeMouseResumeAction()) |action| return action;
                         continue;
                     }
                     return null; // bare ESC quits
@@ -928,13 +942,6 @@ pub const Tui = struct {
         self.result_scroll = 0;
     }
 
-    fn takeMouseResumeAction(self: *Tui) ?Action {
-        if (!self.mouse_resume_requested) return null;
-        self.mouse_resume_requested = false;
-        if (self.sel >= self.hits.items.len) return null;
-        return .{ .idx = self.hits.items[self.sel].idx, .kind = .resume_session };
-    }
-
     fn handleMouseEvent(self: *Tui, ev: MouseEvent) void {
         if (self.filtering_agent or self.filtering_project or self.forking) return;
         if ((ev.button & 64) != 0) {
@@ -944,11 +951,6 @@ pub const Tui = struct {
                 else => {},
             }
             return;
-        }
-        const hit_idx = self.hitAtMouseY(ev.y) orelse return;
-        self.selectHit(hit_idx);
-        if (ev.final == 'M' and (ev.button & 3) == 0 and (ev.button & 32) == 0) {
-            self.mouse_resume_requested = true;
         }
     }
 
@@ -1238,6 +1240,10 @@ pub const Tui = struct {
 
     fn agentAllowed(self: *const Tui, agent: scan.Agent) bool {
         return self.agent_filter_mask == 0 or (self.agent_filter_mask & agentBit(agent)) != 0;
+    }
+
+    fn recordMatchesProject(_: *const Tui, rec: scan.Record, project: []const u8) bool {
+        return std.mem.eql(u8, rec.project, project);
     }
 
     fn openAgentFilterPicker(self: *Tui) void {
@@ -1784,7 +1790,7 @@ test "grouped left and right arrows edit query instead of jumping days" {
     try testing.expectEqual(@as(usize, 1), tui.sel);
 }
 
-test "mouse hover selects result row" {
+test "mouse hover and click do not select result row" {
     var fav = favorites.Set.init(testing.allocator);
     defer fav.deinit();
     const records = [_]scan.Record{
@@ -1799,30 +1805,10 @@ test "mouse hover selects result row" {
 
     const hover_second = "\x1b[<35;12;5M";
     try testing.expectEqual(@as(?usize, hover_second.len), tui.handleEscapeSequence(hover_second));
-
-    try testing.expectEqual(@as(usize, 1), tui.sel);
-}
-
-test "mouse click on result row resumes selected session" {
-    var fav = favorites.Set.init(testing.allocator);
-    defer fav.deinit();
-    const records = [_]scan.Record{
-        .{ .agent = .claude, .project = "p", .session = "a", .text = "first", .ts = 1 },
-        .{ .agent = .claude, .project = "p", .session = "b", .text = "second", .ts = 1 },
-    };
-    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
-    defer tui.hits.deinit(testing.allocator);
-    defer tui.view_rows.deinit(testing.allocator);
-    tui.group_by_day = false;
-    tui.recompute();
-
     const click_second = "\x1b[<0;12;5M";
     try testing.expectEqual(@as(?usize, click_second.len), tui.handleEscapeSequence(click_second));
-    const action = tui.takeMouseResumeAction().?;
 
-    try testing.expectEqual(@as(usize, 1), tui.sel);
-    try testing.expectEqual(@as(u32, 1), action.idx);
-    try testing.expectEqual(Action.Kind.resume_session, action.kind);
+    try testing.expectEqual(@as(usize, 0), tui.sel);
 }
 
 test "flat result row still shows compact last-active time" {
@@ -1844,9 +1830,28 @@ test "flat result row still shows compact last-active time" {
     const prompt_pos = std.mem.indexOf(u8, out.items, "recent prompt").?;
     const title_pos = std.mem.indexOf(u8, out.items, "Session title").?;
     try testing.expect(std.mem.indexOf(u8, out.items, "30m ago") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "30m ago  Session title") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "30m ago  Session title • p") != null);
     try testing.expect(prompt_pos < title_pos);
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, out.items, "\r\n"));
+}
+
+test "result row second line shows No project when project is unknown" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const records = [_]scan.Record{
+        .{ .agent = .codex, .title = "Codex title", .project = "", .session = "s", .text = "prompt text", .ts = 1_800 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+    tui.group_by_day = false;
+    tui.recompute();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    _ = tui.writeResultRow(&out, 0, 80, 3_600, 3);
+
+    try testing.expect(std.mem.indexOf(u8, out.items, "Codex title • No project") != null);
 }
 
 test "cursor result row title falls back to session id" {

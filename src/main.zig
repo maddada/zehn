@@ -88,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
                 \\(run from the session's project directory)
                 \\
                 \\Keys: type to filter · ↑/↓ or ^p/^n move · Enter resume
-                \\      mouse hover selects · click resumes · ^d day grouping
+                \\      mouse wheel moves · clicks do not select · ^d day grouping
                 \\      PgUp/PgDn day · ^t agents · ^r projects
                 \\      ^f favorite · ^e view · ^y copy · ^o fork
                 \\      Esc/^c quit

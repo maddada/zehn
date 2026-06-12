@@ -87,9 +87,9 @@ zehn update      # update to the latest master build
 zehn --version
 ```
 
-Results are grouped by last-active day by default, with the newest day first. Each result uses two content lines plus a spacer: the agent and matched prompt first, then the last-active time under the agent and the session title or session id under the prompt. Press `^d` to toggle day grouping on or off. In grouped mode, PageUp/PageDown jumps to the first session in the previous/next day group; terminals that report modified arrows can also use Ctrl-Up/Ctrl-Down.
+Results are grouped by last-active day by default, with the newest day first. Each result uses two content lines plus a spacer: the agent and matched prompt first, then the last-active time under the agent and the session title or session id plus project name under the prompt. Press `^d` to toggle day grouping on or off. In grouped mode, PageUp/PageDown jumps to the first session in the previous/next day group; terminals that report modified arrows can also use Ctrl-Up/Ctrl-Down.
 
-Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit. Mouse hover selects a session, and click resumes it. Press `^t` for the agent picker, or `^r` for the project picker. The search box has the usual readline-ish editing: left/right, Ctrl-left/right, Ctrl-U, Ctrl-K, Ctrl-backspace, and Ctrl-delete.
+Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit. Mouse wheel moves the current selection, but clicks do not select or resume sessions. Press `^t` for the agent picker, or `^r` for the project picker. The search box has the usual readline-ish editing: left/right, Ctrl-left/right, Ctrl-U, Ctrl-K, Ctrl-backspace, and Ctrl-delete.
 
 Long prompts are a thing, especially if you use `/skill` blocks. Press Tab to focus the preview, PageUp/PageDown to scroll it, left/right to horizontally scroll the selected result, Ctrl-right/Ctrl-left to jump that result to the end/start, `W` to toggle wrapping, and `F` for a larger preview.
 
