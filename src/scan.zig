@@ -77,6 +77,12 @@ pub const Record = struct {
 // CDXC:AgentHistorySearch 2026-06-07-14:59:
 // Claude history rows should show saved session names instead of raw ids when Claude has already indexed a title. Load `sessions-index.json` metadata from normal and profile project stores before parsing history, and sanitize display titles at ingestion so corrupt or control-bearing metadata cannot render mojibake in the result list.
 // Cursor transcript directory names are iterator scratch slices, so copy them before storing as session ids. Otherwise later iteration can corrupt the id shown under Cursor prompts and the resume target attached to the row.
+// CDXC:AgentHistorySearch 2026-06-11-10:02:
+// Project-filtered browsing must include Codex history rows for the selected project even when legacy ~/.codex/history.jsonl records omit cwd. After scanning Codex session files, backfill missing Codex projects by session id instead of making the TUI guess from incomplete records.
+// CDXC:AgentHistorySearch 2026-06-11-10:21:
+// Codex session caches can legitimately contain zero prompt records while the source transcript still has session_meta.cwd. Index Codex session projects from the metadata line itself so cached or promptless sessions still render and filter under their project.
+// CDXC:AgentHistorySearch 2026-06-11-10:25:
+// Cursor Agent transcripts can exist without ACP meta.json cwd. Resolve Cursor's encoded project directory name back to a verified filesystem path so result rows can show the real project name without inventing an invalid resume cwd.
 const codex_cache_version = 4;
 
 const SourceStamp = struct {
@@ -91,6 +97,7 @@ pub const Scanner = struct {
     records: std.ArrayList(Record),
     claude_titles: std.StringHashMap([]const u8),
     codex_titles: std.StringHashMap([]const u8),
+    codex_projects: std.StringHashMap([]const u8),
     /// Set when an opencode DB exists but the `sqlite3` CLI is unavailable.
     sqlite_missing: bool = false,
 
@@ -102,6 +109,7 @@ pub const Scanner = struct {
             .records = .empty,
             .claude_titles = std.StringHashMap([]const u8).init(a),
             .codex_titles = std.StringHashMap([]const u8).init(a),
+            .codex_projects = std.StringHashMap([]const u8).init(a),
         };
     }
 
@@ -279,6 +287,7 @@ pub const Scanner = struct {
         const p = self.path("/.codex/history.jsonl");
         if (self.readAll(p)) |data| self.parseCodexHistory(data);
         self.scanCodexSessions();
+        self.applyCodexSessionProjects();
     }
 
     fn loadCodexSessionIndexTitles(self: *Scanner) void {
@@ -297,6 +306,24 @@ pub const Scanner = struct {
     fn codexTitleForSession(self: *Scanner, session_id: []const u8) ?[]const u8 {
         if (session_id.len == 0) return null;
         return self.codex_titles.get(session_id);
+    }
+
+    fn putCodexProjectIfAbsent(self: *Scanner, session_id: []const u8, project: []const u8) void {
+        if (session_id.len == 0 or project.len == 0) return;
+        if (self.codex_projects.contains(session_id)) return;
+        self.codex_projects.put(session_id, project) catch oom();
+    }
+
+    fn applyCodexSessionProjects(self: *Scanner) void {
+        for (self.records.items) |rec| {
+            if (rec.agent != .codex or rec.session.len == 0 or rec.project.len == 0) continue;
+            self.putCodexProjectIfAbsent(rec.session, rec.project);
+        }
+
+        for (self.records.items) |*rec| {
+            if (rec.agent != .codex or rec.session.len == 0 or rec.project.len != 0) continue;
+            if (self.codex_projects.get(rec.session)) |project| rec.project = project;
+        }
     }
 
     fn scanCodexSessions(self: *Scanner) void {
@@ -331,6 +358,7 @@ pub const Scanner = struct {
 
     fn scanCodexSessionCached(self: *Scanner, source_path: []const u8) void {
         const stat = Io.Dir.cwd().statFile(self.io, source_path, .{}) catch return;
+        self.loadCodexSessionMetadata(source_path);
         const fallback_ts = timestampSeconds(stat.mtime);
         const stamp = self.stampFromStat(stat) orelse {
             _ = self.scanCodexSessionUncached(source_path, fallback_ts);
@@ -347,6 +375,28 @@ pub const Scanner = struct {
         if (self.scanCodexSessionUncached(source_path, fallback_ts)) {
             self.saveCodexCache(cache_path, source_path, stamp, self.records.items[record_start..]);
         }
+    }
+
+    fn loadCodexSessionMetadata(self: *Scanner, source_path: []const u8) void {
+        var buf: [64 * 1024]u8 = undefined;
+        const data = Io.Dir.cwd().readFile(self.io, source_path, &buf) catch return;
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            const v = self.parseLine(line) orelse continue;
+            if (self.recordCodexSessionMetadata(v)) return;
+        }
+    }
+
+    fn recordCodexSessionMetadata(self: *Scanner, v: json.Value) bool {
+        if (v != .object) return false;
+        const typ = stringField(v, "type") orelse return false;
+        if (!std.mem.eql(u8, typ, "session_meta")) return false;
+        const payload = fieldValue(v, "payload") orelse return false;
+        if (payload != .object) return false;
+        const session_id = stringField(payload, "id") orelse return true;
+        const cwd = stringField(payload, "cwd") orelse return true;
+        self.putCodexProjectIfAbsent(session_id, cwd);
+        return true;
     }
 
     fn scanCodexSessionUncached(self: *Scanner, source_path: []const u8, fallback_ts: i64) bool {
@@ -517,6 +567,7 @@ pub const Scanner = struct {
             const typ = o.get("type") orelse continue;
             if (typ != .string) continue;
             if (std.mem.eql(u8, typ.string, "session_meta")) {
+                _ = self.recordCodexSessionMetadata(v);
                 const payload = o.get("payload") orelse continue;
                 if (payload != .object) continue;
                 if (payload.object.get("cwd")) |x| if (x == .string) {
@@ -610,6 +661,7 @@ pub const Scanner = struct {
         var projects = root.iterate();
         while (projects.next(self.io) catch null) |pe| {
             if (pe.kind != .directory) continue;
+            const fallback_project = self.cursorProjectForProjectDirectory(pe.name);
             var project_dir = root.openDir(self.io, pe.name, .{ .iterate = true }) catch continue;
             defer project_dir.close(self.io);
             var transcripts = project_dir.openDir(self.io, "agent-transcripts", .{ .iterate = true }) catch continue;
@@ -623,7 +675,8 @@ pub const Scanner = struct {
                 defer session_dir.close(self.io);
                 const stat = session_dir.statFile(self.io, file_name, .{}) catch continue;
                 const data = session_dir.readFileAlloc(self.io, file_name, self.a, .limited(64 * 1024 * 1024)) catch continue;
-                const info = self.cursorInfoForSession(session_id);
+                var info = self.cursorInfoForSession(session_id);
+                if (info.project.len == 0) info.project = fallback_project;
                 self.parseCursorTranscript(data, info.project, info.title, session_id, timestampSeconds(stat.mtime));
             }
         }
@@ -639,6 +692,58 @@ pub const Scanner = struct {
         const data = self.readAll(meta_path) orelse return .{};
         const v = json.parseFromSliceLeaky(json.Value, self.a, data, .{}) catch return .{};
         return .{ .project = stringField(v, "cwd") orelse "", .title = titleFromFields(v, &.{ "thread_name", "threadName", "title", "session_title", "sessionTitle" }) orelse "" };
+    }
+
+    fn cursorProjectForProjectDirectory(self: *Scanner, encoded_project: []const u8) []const u8 {
+        return self.resolveCursorEncodedProjectPath("/", encoded_project, 0) orelse "";
+    }
+
+    fn resolveCursorEncodedProjectPath(self: *Scanner, current_path: []const u8, remaining: []const u8, depth: usize) ?[]const u8 {
+        if (remaining.len == 0) return current_path;
+        if (depth > 32) return null;
+
+        var dir = Io.Dir.cwd().openDir(self.io, current_path, .{ .iterate = true }) catch return null;
+        defer dir.close(self.io);
+        var entries = dir.iterate();
+        while (entries.next(self.io) catch null) |entry| {
+            if (entry.kind != .directory and entry.kind != .sym_link) continue;
+            const encoded_name = self.cursorEncodedPathSegment(entry.name);
+            if (encoded_name.len == 0) continue;
+            const child_path = self.cursorChildPath(current_path, entry.name);
+            if (std.mem.eql(u8, remaining, encoded_name)) return child_path;
+            if (remaining.len > encoded_name.len and
+                remaining[encoded_name.len] == '-' and
+                std.mem.startsWith(u8, remaining, encoded_name))
+            {
+                if (self.resolveCursorEncodedProjectPath(child_path, remaining[encoded_name.len + 1 ..], depth + 1)) |resolved| {
+                    return resolved;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn cursorChildPath(self: *Scanner, parent: []const u8, child: []const u8) []const u8 {
+        if (std.mem.eql(u8, parent, "/")) return std.fmt.allocPrint(self.a, "/{s}", .{child}) catch oom();
+        return std.fmt.allocPrint(self.a, "{s}/{s}", .{ parent, child }) catch oom();
+    }
+
+    fn cursorEncodedPathSegment(self: *Scanner, segment: []const u8) []const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var last_dash = true;
+        for (segment) |c| {
+            if (std.ascii.isAlphanumeric(c)) {
+                out.append(self.a, c) catch oom();
+                last_dash = false;
+            } else if (c == '_') {
+                continue;
+            } else if (!last_dash) {
+                out.append(self.a, '-') catch oom();
+                last_dash = true;
+            }
+        }
+        if (out.items.len > 0 and out.items[out.items.len - 1] == '-') _ = out.pop();
+        return out.items;
     }
 
     /// Parse Cursor Agent transcript JSONL from ~/.cursor/projects/*/agent-transcripts.
@@ -1040,6 +1145,7 @@ fn testScanner(a: std.mem.Allocator) Scanner {
         .records = .empty,
         .claude_titles = std.StringHashMap([]const u8).init(a),
         .codex_titles = std.StringHashMap([]const u8).init(a),
+        .codex_projects = std.StringHashMap([]const u8).init(a),
     };
 }
 
@@ -1112,6 +1218,16 @@ test "cursor title metadata ignores generic name field" {
     try testing.expect(Scanner.titleFromFields(v, &.{ "thread_name", "threadName", "title", "session_title", "sessionTitle" }) == null);
 }
 
+test "cursor project directory encoding matches path segment names" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+
+    try testing.expectEqualStrings("active", sc.cursorEncodedPathSegment("_active"));
+    try testing.expectEqualStrings("Application-Support", sc.cursorEncodedPathSegment("Application Support"));
+    try testing.expectEqualStrings("com-mitchellh-ghostty", sc.cursorEncodedPathSegment("com.mitchellh.ghostty"));
+}
+
 test "parse codex history" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1129,6 +1245,46 @@ test "parse codex history" {
     try testing.expectEqualStrings("abc", sc.records.items[0].session);
     try testing.expectEqual(@as(i64, 1779186371), sc.records.items[0].ts);
     try testing.expectEqual(Agent.codex, sc.records.items[0].agent);
+}
+
+test "codex history records inherit projects from scanned sessions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    const history_data =
+        \\{"session_id":"abc","ts":1779186371,"text":"history prompt"}
+    ;
+    const session_data =
+        \\{"type":"session_meta","payload":{"cwd":"/work/proj","id":"abc"}}
+        \\{"type":"response_item","timestamp":"2026-06-07T07:00:00Z","payload":{"type":"message","role":"user","content":[{"type":"text","text":"session prompt"}]}}
+    ;
+
+    sc.parseCodexHistory(history_data);
+    sc.parseCodexSession(session_data);
+    sc.applyCodexSessionProjects();
+
+    try testing.expectEqual(@as(usize, 2), sc.records.items.len);
+    try testing.expectEqualStrings("/work/proj", sc.records.items[0].project);
+    try testing.expectEqualStrings("/work/proj", sc.records.items[1].project);
+}
+
+test "codex history records inherit projects from session metadata without prompt records" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    const history_data =
+        \\{"session_id":"abc","ts":1779186371,"text":"history prompt"}
+    ;
+    const meta = sc.parseLine(
+        \\{"type":"session_meta","payload":{"cwd":"/Users/madda/dev/_active/zmux","id":"abc"}}
+    ).?;
+
+    sc.parseCodexHistory(history_data);
+    try testing.expect(sc.recordCodexSessionMetadata(meta));
+    sc.applyCodexSessionProjects();
+
+    try testing.expectEqual(@as(usize, 1), sc.records.items.len);
+    try testing.expectEqualStrings("/Users/madda/dev/_active/zmux", sc.records.items[0].project);
 }
 
 test "codex cache round-trips records and rejects stale source metadata" {
