@@ -133,13 +133,14 @@ pub const Tui = struct {
     preview_focus: bool = false,
     wrap_preview: bool = true,
     fullscreen_preview: bool = false,
-    // CDXC:AgentHistorySearch 2026-06-07-08:27:
-    // Search results should default to day-grouped browsing so users can see when sessions were last active. Ctrl-D toggles the grouping.
+    // CDXC:AgentHistorySearch 2026-06-16-18:16:
+    // Search results should start as a flat relevance list; day grouping remains opt-in through Ctrl-D for users who want date sections.
+    // Recomputing after query edits, agent/project filter changes, or day-group toggles should return to the first visible result instead of preserving a stale scroll position.
     // CDXC:AgentHistorySearch 2026-06-07-15:12:
     // Plain left/right must stay available for query editing or preview horizontal scroll. Grouped day jumps use PageUp/PageDown, with Ctrl-Up/Ctrl-Down as an extra path when the terminal reports modified arrow keys.
     // CDXC:AgentHistorySearch 2026-06-07-11:27:
     // Result rows should be prompt-first two-line entries: agent and matched prompt on line one, last-active time under the agent, and the gray session title/id starting under the prompt text on line two. Selected rows use gold text on a silver background across both lines, and blank spacer rows separate entries.
-    group_by_day: bool = true,
+    group_by_day: bool = false,
     // CDXC:AgentHistorySearch 2026-06-11-10:02:
     // Search result second rows must append ` • <Project Name>` after the session title/id and show `No project` when project metadata is unknown.
     // Mouse hover and clicks must not select or resume a result; Enter is the only resume action, while wheel input may still move the current keyboard selection.
@@ -919,19 +920,8 @@ pub const Tui = struct {
     }
 
     fn toggleDayGrouping(self: *Tui) void {
-        const rec_idx: ?u32 = if (self.sel < self.hits.items.len) self.hits.items[self.sel].idx else null;
         self.group_by_day = !self.group_by_day;
         self.recompute();
-        if (rec_idx) |idx| self.selectRecord(idx);
-    }
-
-    fn selectRecord(self: *Tui, rec_idx: u32) void {
-        for (self.hits.items, 0..) |hit, i| {
-            if (hit.idx == rec_idx) {
-                self.selectHit(i);
-                return;
-            }
-        }
     }
 
     fn selectHit(self: *Tui, hit_idx: usize) void {
@@ -1710,7 +1700,44 @@ test "selection changes reset preview and result scroll" {
     try testing.expectEqual(@as(usize, 0), tui.result_scroll);
 }
 
-test "default results are grouped by last-active day" {
+test "query edits reset list scroll to the first result" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "s1", .text = "alpha", .ts = 1 },
+        .{ .agent = .claude, .project = "p", .session = "s2", .text = "alphabet", .ts = 2 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+    defer tui.query.deinit(testing.allocator);
+    defer tui.matcher.deinit();
+    tui.recompute();
+    tui.sel = 1;
+    tui.top = 1;
+    tui.preview_scroll = 2;
+    tui.result_scroll = 3;
+
+    tui.insertQueryByte('a');
+
+    try testing.expectEqual(@as(usize, 0), tui.sel);
+    try testing.expectEqual(@as(usize, 0), tui.top);
+    try testing.expectEqual(@as(usize, 0), tui.preview_scroll);
+    try testing.expectEqual(@as(usize, 0), tui.result_scroll);
+
+    tui.sel = 1;
+    tui.top = 1;
+    tui.preview_scroll = 2;
+    tui.result_scroll = 3;
+    tui.backspace();
+
+    try testing.expectEqual(@as(usize, 0), tui.sel);
+    try testing.expectEqual(@as(usize, 0), tui.top);
+    try testing.expectEqual(@as(usize, 0), tui.preview_scroll);
+    try testing.expectEqual(@as(usize, 0), tui.result_scroll);
+}
+
+test "default results start flat and newest first" {
     var fav = favorites.Set.init(testing.allocator);
     defer fav.deinit();
     const day_old = 20_000 * seconds_per_day;
@@ -1726,12 +1753,37 @@ test "default results are grouped by last-active day" {
 
     tui.recompute();
 
+    try testing.expect(!tui.group_by_day);
+    try testing.expectEqual(@as(usize, 3), tui.view_rows.items.len);
+    try testing.expectEqual(@as(u32, 2), tui.hits.items[tui.view_rows.items[0].hit].idx);
+    try testing.expectEqual(@as(u32, 1), tui.hits.items[tui.view_rows.items[1].hit].idx);
+    try testing.expectEqual(@as(u32, 0), tui.hits.items[tui.view_rows.items[2].hit].idx);
+}
+
+test "day grouping toggle resets to first visible result" {
+    var fav = favorites.Set.init(testing.allocator);
+    defer fav.deinit();
+    const records = [_]scan.Record{
+        .{ .agent = .claude, .project = "p", .session = "a", .text = "same", .ts = 1 },
+        .{ .agent = .codex, .project = "p", .session = "b", .text = "same", .ts = 2 },
+        .{ .agent = .pi, .project = "p", .session = "c", .text = "same", .ts = 3 },
+    };
+    var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
+    defer tui.hits.deinit(testing.allocator);
+    defer tui.view_rows.deinit(testing.allocator);
+    tui.recompute();
+    tui.sel = 2;
+    tui.top = 1;
+    tui.preview_scroll = 4;
+    tui.result_scroll = 8;
+
+    tui.toggleDayGrouping();
+
     try testing.expect(tui.group_by_day);
-    try testing.expectEqual(@as(usize, 5), tui.view_rows.items.len);
-    try testing.expectEqual(Tui.dayKey(day_new), tui.view_rows.items[0].day);
-    try testing.expectEqual(@as(u32, 2), tui.hits.items[tui.view_rows.items[1].hit].idx);
-    try testing.expectEqual(@as(u32, 1), tui.hits.items[tui.view_rows.items[2].hit].idx);
-    try testing.expectEqual(Tui.dayKey(day_old), tui.view_rows.items[3].day);
+    try testing.expectEqual(@as(usize, 0), tui.sel);
+    try testing.expectEqual(@as(usize, 0), tui.top);
+    try testing.expectEqual(@as(usize, 0), tui.preview_scroll);
+    try testing.expectEqual(@as(usize, 0), tui.result_scroll);
 }
 
 test "grouped page keys and ctrl arrows jump to adjacent day starts" {
@@ -1747,6 +1799,7 @@ test "grouped page keys and ctrl arrows jump to adjacent day starts" {
     var tui = Tui.init(testing.allocator, undefined, &records, &fav, "");
     defer tui.hits.deinit(testing.allocator);
     defer tui.view_rows.deinit(testing.allocator);
+    tui.group_by_day = true;
     tui.recompute();
     tui.sel = 1;
 
@@ -1776,6 +1829,7 @@ test "grouped left and right arrows edit query instead of jumping days" {
     defer tui.hits.deinit(testing.allocator);
     defer tui.view_rows.deinit(testing.allocator);
     defer tui.query.deinit(testing.allocator);
+    tui.group_by_day = true;
     tui.recompute();
     tui.sel = 1;
     try tui.query.appendSlice(testing.allocator, "ab");
@@ -1910,8 +1964,16 @@ test "interactive agent filter picker filters hits" {
 
     tui.openAgentFilterPicker();
     try testing.expectEqual(@as(usize, 0), tui.filter_sel);
+    tui.sel = 1;
+    tui.top = 1;
+    tui.preview_scroll = 2;
+    tui.result_scroll = 3;
     tui.toggleFilterSelection();
     try testing.expectEqual(@as(u8, 1), tui.agent_filter_mask);
+    try testing.expectEqual(@as(usize, 0), tui.sel);
+    try testing.expectEqual(@as(usize, 0), tui.top);
+    try testing.expectEqual(@as(usize, 0), tui.preview_scroll);
+    try testing.expectEqual(@as(usize, 0), tui.result_scroll);
     try testing.expectEqual(@as(usize, 1), tui.hits.items.len);
     try testing.expectEqual(scan.Agent.claude, records[tui.hits.items[0].idx].agent);
 

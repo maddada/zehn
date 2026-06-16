@@ -18,6 +18,12 @@ const first_char_mult: i32 = 2;
 
 const NEG: i32 = std.math.minInt(i32) / 2;
 
+// CDXC:AgentHistorySearch 2026-06-16-18:16:
+// Search filtering must stop showing sessions just because the query is a loose subsequence. Non-empty queries need both a minimum score percentage against an ideal match and compact per-term spans, so unrelated prompts with scattered matching bytes are rejected before ranking.
+const min_score_quality_percent: i32 = 50;
+const min_term_compactness_percent: i32 = 35;
+const min_compact_term_len: usize = 3;
+
 // Above this much DP work, fall back to the greedy scorer to stay fast on
 // pathologically large haystacks.
 const dp_budget: usize = 200_000;
@@ -68,6 +74,16 @@ pub const Matcher = struct {
         return .{ .a = a };
     }
 
+    pub fn deinit(self: *Matcher) void {
+        const a = self.a;
+        if (self.mm.len > 0) self.a.free(self.mm);
+        if (self.par.len > 0) self.a.free(self.par);
+        if (self.b.len > 0) self.a.free(self.b);
+        if (self.r_best.len > 0) self.a.free(self.r_best);
+        if (self.r_arg.len > 0) self.a.free(self.r_arg);
+        self.* = .{ .a = a };
+    }
+
     fn ensure(self: *Matcher, cells: usize, win: usize) bool {
         if (self.mm.len < cells) {
             self.mm = self.a.realloc(self.mm, cells) catch return false;
@@ -82,6 +98,10 @@ pub const Matcher = struct {
     }
 
     pub fn match(self: *Matcher, needle: []const u8, hay: []const u8) ?Match {
+        return qualityFilter(needle, self.rawMatch(needle, hay));
+    }
+
+    fn rawMatch(self: *Matcher, needle: []const u8, hay: []const u8) ?Match {
         if (needle.len == 0) return Match{ .score = 0 };
         if (hay.len == 0) return null;
 
@@ -259,12 +279,74 @@ fn greedy(needle: []const u8, hay: []const u8, start: usize) ?Match {
     return m;
 }
 
+fn qualityFilter(needle: []const u8, maybe_match: ?Match) ?Match {
+    const m = maybe_match orelse return null;
+    if (needle.len == 0) return m;
+    if (matchQualityPercent(needle, m) < min_score_quality_percent) return null;
+    if (!termsAreCompactEnough(needle, m)) return null;
+    return m;
+}
+
+pub fn matchQualityPercent(needle: []const u8, m: Match) i32 {
+    const ideal = idealScore(needle.len);
+    if (ideal <= 0) return 100;
+    if (m.score <= 0) return 0;
+    const pct = @divTrunc(@as(i64, m.score) * 100, @as(i64, ideal));
+    return @intCast(@min(pct, 100));
+}
+
+fn idealScore(needle_len: usize) i32 {
+    if (needle_len == 0) return 0;
+    const n: i32 = @intCast(needle_len);
+    return score_match * n + bonus_boundary * first_char_mult + bonus_boundary * (n - 1);
+}
+
+fn termsAreCompactEnough(needle: []const u8, m: Match) bool {
+    if (m.pos_len < needle.len) return true;
+
+    var ni: usize = 0;
+    var pi: usize = 0;
+    while (ni < needle.len and pi < m.pos_len) {
+        while (ni < needle.len and isQuerySeparator(needle[ni])) {
+            ni += 1;
+            pi += 1;
+        }
+        if (ni >= needle.len or pi >= m.pos_len) break;
+
+        const term_pos_start = pi;
+        var term_len: usize = 0;
+        while (ni < needle.len and !isQuerySeparator(needle[ni]) and pi < m.pos_len) {
+            ni += 1;
+            pi += 1;
+            term_len += 1;
+        }
+        if (term_len < min_compact_term_len) continue;
+
+        const first = m.positions[term_pos_start];
+        const last = m.positions[pi - 1];
+        const span = @as(usize, last - first) + 1;
+        const compactness = @divTrunc(term_len * 100, span);
+        if (compactness < min_term_compactness_percent) return false;
+    }
+
+    return true;
+}
+
+fn isQuerySeparator(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
 /// Convenience wrapper for one-off matching (allocates scratch each call).
 /// Test-only: leaks its scratch buffers, so do not use on a hot path — the
 /// runtime uses a reusable `Matcher` instead.
 pub fn match(needle: []const u8, hay: []const u8) ?Match {
     var m = Matcher.init(std.heap.page_allocator);
     return m.match(needle, hay);
+}
+
+fn rawMatchForTest(needle: []const u8, hay: []const u8) ?Match {
+    var m = Matcher.init(std.heap.page_allocator);
+    return m.rawMatch(needle, hay);
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +449,7 @@ test "optimality: DP equals brute-force optimum on random small inputs" {
         const hay = hbuf[0..hl];
         const ndl = nbuf[0..nl];
 
-        const dp_res = match(ndl, hay);
+        const dp_res = rawMatchForTest(ndl, hay);
         const brute = bruteBest(ndl, hay);
         try testing.expectEqual(brute == null, dp_res == null);
         if (dp_res) |d| {
@@ -390,6 +472,16 @@ test "consecutive scores higher than gapped" {
     try testing.expect(consec.score > gapped.score);
 }
 
+test "quality gate rejects scattered unrelated terms" {
+    try testing.expect(match("auth", "add user tool history") == null);
+    try testing.expect(match("abc", "a long unrelated b prompt c") == null);
+}
+
+test "quality gate keeps compact fuzzy abbreviations" {
+    try testing.expect(match("auth", "add auth middleware") != null);
+    try testing.expect(match("zhn", "zehn finder") != null);
+}
+
 test "positions are ascending and correct" {
     const r = match("zhn", "zehn finder").?;
     const p = r.positions[0..r.pos_len];
@@ -401,13 +493,7 @@ test "positions are ascending and correct" {
 
 test "matcher reuse across queries" {
     var mt = Matcher.init(testing.allocator);
-    defer {
-        if (mt.mm.len > 0) testing.allocator.free(mt.mm);
-        if (mt.par.len > 0) testing.allocator.free(mt.par);
-        if (mt.b.len > 0) testing.allocator.free(mt.b);
-        if (mt.r_best.len > 0) testing.allocator.free(mt.r_best);
-        if (mt.r_arg.len > 0) testing.allocator.free(mt.r_arg);
-    }
+    defer mt.deinit();
     try testing.expect(mt.match("foo", "foobar") != null);
     try testing.expect(mt.match("bar", "foobar") != null);
     try testing.expect(mt.match("zzz", "foobar") == null);

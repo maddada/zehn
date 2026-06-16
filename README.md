@@ -87,7 +87,7 @@ zehn update      # update to the latest master build
 zehn --version
 ```
 
-Results are grouped by last-active day by default, with the newest day first. Each result uses two content lines plus a spacer: the agent and matched prompt first, then the last-active time under the agent and the session title or session id plus project name under the prompt. Press `^d` to toggle day grouping on or off. In grouped mode, PageUp/PageDown jumps to the first session in the previous/next day group; terminals that report modified arrows can also use Ctrl-Up/Ctrl-Down.
+Results start as a flat relevance list, newest near-equivalent matches first. Each result uses two content lines plus a spacer: the agent and matched prompt first, then the last-active time under the agent and the session title or session id plus project name under the prompt. Press `^d` to toggle day grouping on or off. In grouped mode, PageUp/PageDown jumps to the first session in the previous/next day group; terminals that report modified arrows can also use Ctrl-Up/Ctrl-Down.
 
 Keys: type to filter, `↑`/`↓` or `^p`/`^n` to move, Enter to pick, Esc or `^c` to quit. Mouse wheel moves the current selection, but clicks do not select or resume sessions. Press `^t` for the agent picker, or `^r` for the project picker. The search box has the usual readline-ish editing: left/right, Ctrl-left/right, Ctrl-U, Ctrl-K, Ctrl-backspace, and Ctrl-delete.
 
@@ -133,7 +133,7 @@ deleted at any time.
 
 ## How matching works
 
-The search is not a plain substring filter. It is an fzf-style optimal alignment: a Smith-Waterman variant with affine gap penalties and extra credit for letters that land on word boundaries, camelCase humps, or in an unbroken run. In practice that means typing `auth` surfaces "add **auth** middleware" above some prompt where a, u, t, h happen to be scattered across the line.
+The search is not a plain substring filter. It is an fzf-style optimal alignment: a Smith-Waterman variant with affine gap penalties and extra credit for letters that land on word boundaries, camelCase humps, or in an unbroken run. Non-empty searches also have to clear a quality gate: weak subsequence matches with low score quality or very scattered term spans are filtered out instead of merely ranked lower.
 
 "Optimal" is not a marketing word here. A test runs the matcher against a brute-force reference over thousands of random inputs and checks that the scores come out identical.
 
