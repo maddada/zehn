@@ -83,7 +83,11 @@ pub const Record = struct {
 // Codex session caches can legitimately contain zero prompt records while the source transcript still has session_meta.cwd. Index Codex session projects from the metadata line itself so cached or promptless sessions still render and filter under their project.
 // CDXC:AgentHistorySearch 2026-06-11-10:25:
 // Cursor Agent transcripts can exist without ACP meta.json cwd. Resolve Cursor's encoded project directory name back to a verified filesystem path so result rows can show the real project name without inventing an invalid resume cwd.
-const codex_cache_version = 4;
+// CDXC:AgentHistorySearch 2026-06-28-07:49:
+// Codex session transcripts now emit current user prompt blocks as `input_text` as well as the older `text` shape. Accept both shapes and move the derived cache to v5 so sessions previously cached as zero-record parses are rebuilt.
+// Large Codex transcripts must still be indexed instead of disappearing at the bounded whole-file read limit. Use a streaming Codex-only JSONL path for oversized transcripts so prompt extraction stays proportional to the retained prompt text, not the full transcript size.
+const codex_cache_version = 5;
+const max_history_file_bytes = 64 * 1024 * 1024;
 
 const SourceStamp = struct {
     size_text: []const u8,
@@ -119,7 +123,7 @@ pub const Scanner = struct {
 
     fn readAll(self: *Scanner, file_path: []const u8) ?[]u8 {
         const dir = Io.Dir.cwd();
-        return dir.readFileAlloc(self.io, file_path, self.a, .limited(64 * 1024 * 1024)) catch null;
+        return dir.readFileAlloc(self.io, file_path, self.a, .limited(max_history_file_bytes)) catch null;
     }
 
     fn add(self: *Scanner, r: Record) void {
@@ -127,16 +131,17 @@ pub const Scanner = struct {
     }
 
     /// Extract plain text from a message `content` field that may be either a
-    /// JSON string or an array of {type:"text", text:"..."} blocks.
+    /// JSON string or an array of text-bearing content blocks.
     fn contentText(self: *Scanner, v: json.Value) ?[]const u8 {
         switch (v) {
-            .string => |s| return s,
+            .string => |s| return self.copyString(s),
             .array => |arr| {
                 var buf: std.ArrayList(u8) = .empty;
                 for (arr.items) |item| {
                     if (item != .object) continue;
                     const t = item.object.get("type") orelse continue;
-                    if (t != .string or !std.mem.eql(u8, t.string, "text")) continue;
+                    if (t != .string) continue;
+                    if (!std.mem.eql(u8, t.string, "text") and !std.mem.eql(u8, t.string, "input_text")) continue;
                     const txt = item.object.get("text") orelse continue;
                     if (txt != .string) continue;
                     if (buf.items.len > 0) buf.append(self.a, ' ') catch oom();
@@ -153,6 +158,10 @@ pub const Scanner = struct {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0 or trimmed[0] != '{') return null;
         return json.parseFromSliceLeaky(json.Value, self.a, trimmed, .{}) catch null;
+    }
+
+    fn copyString(self: *Scanner, value: []const u8) []const u8 {
+        return self.a.dupe(u8, value) catch oom();
     }
 
     pub fn scanAll(self: *Scanner) void {
@@ -311,7 +320,7 @@ pub const Scanner = struct {
     fn putCodexProjectIfAbsent(self: *Scanner, session_id: []const u8, project: []const u8) void {
         if (session_id.len == 0 or project.len == 0) return;
         if (self.codex_projects.contains(session_id)) return;
-        self.codex_projects.put(session_id, project) catch oom();
+        self.codex_projects.put(self.copyString(session_id), self.copyString(project)) catch oom();
     }
 
     fn applyCodexSessionProjects(self: *Scanner) void {
@@ -361,18 +370,18 @@ pub const Scanner = struct {
         self.loadCodexSessionMetadata(source_path);
         const fallback_ts = timestampSeconds(stat.mtime);
         const stamp = self.stampFromStat(stat) orelse {
-            _ = self.scanCodexSessionUncached(source_path, fallback_ts);
+            _ = self.scanCodexSessionUncached(source_path, fallback_ts, stat.size);
             return;
         };
         const cache_path = self.codexCachePath(source_path) orelse {
-            _ = self.scanCodexSessionUncached(source_path, fallback_ts);
+            _ = self.scanCodexSessionUncached(source_path, fallback_ts, stat.size);
             return;
         };
         if (self.readAll(cache_path)) |data| {
             if (self.parseCodexCache(data, source_path, stamp)) return;
         }
         const record_start = self.records.items.len;
-        if (self.scanCodexSessionUncached(source_path, fallback_ts)) {
+        if (self.scanCodexSessionUncached(source_path, fallback_ts, stat.size)) {
             self.saveCodexCache(cache_path, source_path, stamp, self.records.items[record_start..]);
         }
     }
@@ -399,9 +408,43 @@ pub const Scanner = struct {
         return true;
     }
 
-    fn scanCodexSessionUncached(self: *Scanner, source_path: []const u8, fallback_ts: i64) bool {
-        const data = self.readAll(source_path) orelse return false;
+    fn scanCodexSessionUncached(self: *Scanner, source_path: []const u8, fallback_ts: i64, source_size: u64) bool {
+        if (source_size > max_history_file_bytes) {
+            return self.scanCodexSessionStreaming(source_path, fallback_ts);
+        }
+        const data = self.readAll(source_path) orelse return self.scanCodexSessionStreaming(source_path, fallback_ts);
         self.parseCodexSessionWithLastActive(data, fallback_ts);
+        return true;
+    }
+
+    fn scanCodexSessionStreaming(self: *Scanner, source_path: []const u8, fallback_ts: i64) bool {
+        var file = Io.Dir.cwd().openFile(self.io, source_path, .{}) catch return false;
+        defer file.close(self.io);
+
+        var state = CodexSessionParseState{
+            .record_start = self.records.items.len,
+            .fallback_ts = fallback_ts,
+        };
+        var reader_buf: [64 * 1024]u8 = undefined;
+        var reader = file.readerStreaming(self.io, &reader_buf);
+        var chunk_buf: [64 * 1024]u8 = undefined;
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(self.a);
+
+        while (true) {
+            const n = reader.interface.readSliceShort(&chunk_buf) catch return false;
+            if (n == 0) break;
+            var start: usize = 0;
+            for (chunk_buf[0..n], 0..) |byte, index| {
+                if (byte != '\n') continue;
+                line.appendSlice(self.a, chunk_buf[start..index]) catch oom();
+                self.parseCodexSessionLine(line.items, &state);
+                line.clearRetainingCapacity();
+                start = index + 1;
+            }
+            if (start < n) line.appendSlice(self.a, chunk_buf[start..n]) catch oom();
+        }
+        if (line.items.len > 0) self.parseCodexSessionLine(line.items, &state);
         return true;
     }
 
@@ -416,7 +459,7 @@ pub const Scanner = struct {
         var h = std.hash.Wyhash.init(0);
         h.update(source_path);
         const id = h.final();
-        return std.fmt.allocPrint(self.a, "{s}/.ghostex/zehn/codex-sessions-v4/{x:0>16}.jsonl", .{ self.home, id }) catch null;
+        return std.fmt.allocPrint(self.a, "{s}/.ghostex/zehn/codex-sessions-v5/{x:0>16}.jsonl", .{ self.home, id }) catch null;
     }
 
     fn saveCodexCache(self: *Scanner, cache_path: []const u8, source_path: []const u8, stamp: SourceStamp, records: []const Record) void {
@@ -552,81 +595,93 @@ pub const Scanner = struct {
         self.parseCodexSessionWithLastActive(data, 0);
     }
 
+    const CodexSessionParseState = struct {
+        cwd: []const u8 = "",
+        session_id: []const u8 = "",
+        session_title: []const u8 = "",
+        meta: Meta = .{},
+        record_start: usize,
+        fallback_ts: i64,
+    };
+
     fn parseCodexSessionWithLastActive(self: *Scanner, data: []const u8, fallback_ts: i64) void {
-        var cwd: []const u8 = "";
-        var session_id: []const u8 = "";
-        var session_title: []const u8 = "";
-        var meta: Meta = .{};
-        const record_start = self.records.items.len;
+        var state = CodexSessionParseState{
+            .record_start = self.records.items.len,
+            .fallback_ts = fallback_ts,
+        };
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
-            const v = self.parseLine(line) orelse continue;
-            if (v != .object) continue;
-            const line_ts = timestampFromObject(v);
-            const o = v.object;
-            const typ = o.get("type") orelse continue;
-            if (typ != .string) continue;
-            if (std.mem.eql(u8, typ.string, "session_meta")) {
-                _ = self.recordCodexSessionMetadata(v);
-                const payload = o.get("payload") orelse continue;
-                if (payload != .object) continue;
-                if (payload.object.get("cwd")) |x| if (x == .string) {
-                    cwd = x.string;
-                };
-                if (payload.object.get("id")) |x| if (x == .string) {
-                    session_id = x.string;
-                    if (self.codexTitleForSession(session_id)) |title| {
-                        session_title = title;
-                        self.applyTitleToSessionRecords(record_start, session_title);
-                    }
-                };
-                if (session_title.len == 0) if (titleFromObject(payload)) |title| {
-                    session_title = title;
-                    self.applyTitleToSessionRecords(record_start, session_title);
-                };
-                if (payload.object.get("model_provider")) |x| if (x == .string) {
-                    meta.provider = x.string;
-                };
-                self.applyMetaToSessionRecords(record_start, meta);
-                continue;
-            }
-            if (std.mem.eql(u8, typ.string, "event_msg")) {
-                const payload = o.get("payload") orelse continue;
-                if (payload != .object) continue;
-                const ptype = payload.object.get("type") orelse continue;
-                if (ptype != .string or !std.mem.eql(u8, ptype.string, "token_count")) continue;
-                if (payload.object.get("info")) |info| if (info == .object) {
-                    if (info.object.get("model_context_window")) |x| meta.usage.context_window = intVal(x);
-                    if (info.object.get("total_token_usage")) |u| if (u == .object) {
-                        meta.usage.input = if (u.object.get("input_tokens")) |x| intVal(x) else meta.usage.input;
-                        meta.usage.output = if (u.object.get("output_tokens")) |x| intVal(x) else meta.usage.output;
-                        meta.usage.cache_read = if (u.object.get("cached_input_tokens")) |x| intVal(x) else meta.usage.cache_read;
-                        meta.usage.total = if (u.object.get("total_tokens")) |x| intVal(x) else meta.usage.total;
-                    };
-                };
-                if (payload.object.get("rate_limits")) |rl| if (rl == .object) {
-                    if (rl.object.get("primary")) |primary| if (primary == .object) {
-                        meta.usage.rate_percent = if (primary.object.get("used_percent")) |x| floatVal(x) else meta.usage.rate_percent;
-                    };
-                    if (rl.object.get("plan_type")) |x| if (x == .string) {
-                        meta.plan = x.string;
-                    };
-                };
-                self.applyMetaToSessionRecords(record_start, meta);
-                continue;
-            }
-            if (!std.mem.eql(u8, typ.string, "response_item")) continue;
-            const payload = o.get("payload") orelse continue;
-            if (payload != .object) continue;
-            const ptype = payload.object.get("type") orelse continue;
-            if (ptype != .string or !std.mem.eql(u8, ptype.string, "message")) continue;
-            const role = payload.object.get("role") orelse continue;
-            if (role != .string or !std.mem.eql(u8, role.string, "user")) continue;
-            const content = payload.object.get("content") orelse continue;
-            const text = self.contentText(content) orelse continue;
-            if (text.len == 0 or std.mem.startsWith(u8, text, "<")) continue;
-            self.add(.{ .agent = .codex, .title = session_title, .text = text, .project = cwd, .session = session_id, .ts = if (fallback_ts > 0) fallback_ts else line_ts, .meta = meta });
+            self.parseCodexSessionLine(line, &state);
         }
+    }
+
+    fn parseCodexSessionLine(self: *Scanner, line: []const u8, state: *CodexSessionParseState) void {
+        const v = self.parseLine(line) orelse return;
+        if (v != .object) return;
+        const line_ts = timestampFromObject(v);
+        const o = v.object;
+        const typ = o.get("type") orelse return;
+        if (typ != .string) return;
+        if (std.mem.eql(u8, typ.string, "session_meta")) {
+            _ = self.recordCodexSessionMetadata(v);
+            const payload = o.get("payload") orelse return;
+            if (payload != .object) return;
+            if (payload.object.get("cwd")) |x| if (x == .string) {
+                state.cwd = self.copyString(x.string);
+            };
+            if (payload.object.get("id")) |x| if (x == .string) {
+                state.session_id = self.copyString(x.string);
+                if (self.codexTitleForSession(state.session_id)) |title| {
+                    state.session_title = title;
+                    self.applyTitleToSessionRecords(state.record_start, state.session_title);
+                }
+            };
+            if (state.session_title.len == 0) if (titleFromObject(payload)) |title| {
+                state.session_title = self.copyString(title);
+                self.applyTitleToSessionRecords(state.record_start, state.session_title);
+            };
+            if (payload.object.get("model_provider")) |x| if (x == .string) {
+                state.meta.provider = self.copyString(x.string);
+            };
+            self.applyMetaToSessionRecords(state.record_start, state.meta);
+            return;
+        }
+        if (std.mem.eql(u8, typ.string, "event_msg")) {
+            const payload = o.get("payload") orelse return;
+            if (payload != .object) return;
+            const ptype = payload.object.get("type") orelse return;
+            if (ptype != .string or !std.mem.eql(u8, ptype.string, "token_count")) return;
+            if (payload.object.get("info")) |info| if (info == .object) {
+                if (info.object.get("model_context_window")) |x| state.meta.usage.context_window = intVal(x);
+                if (info.object.get("total_token_usage")) |u| if (u == .object) {
+                    state.meta.usage.input = if (u.object.get("input_tokens")) |x| intVal(x) else state.meta.usage.input;
+                    state.meta.usage.output = if (u.object.get("output_tokens")) |x| intVal(x) else state.meta.usage.output;
+                    state.meta.usage.cache_read = if (u.object.get("cached_input_tokens")) |x| intVal(x) else state.meta.usage.cache_read;
+                    state.meta.usage.total = if (u.object.get("total_tokens")) |x| intVal(x) else state.meta.usage.total;
+                };
+            };
+            if (payload.object.get("rate_limits")) |rl| if (rl == .object) {
+                if (rl.object.get("primary")) |primary| if (primary == .object) {
+                    state.meta.usage.rate_percent = if (primary.object.get("used_percent")) |x| floatVal(x) else state.meta.usage.rate_percent;
+                };
+                if (rl.object.get("plan_type")) |x| if (x == .string) {
+                    state.meta.plan = self.copyString(x.string);
+                };
+            };
+            self.applyMetaToSessionRecords(state.record_start, state.meta);
+            return;
+        }
+        if (!std.mem.eql(u8, typ.string, "response_item")) return;
+        const payload = o.get("payload") orelse return;
+        if (payload != .object) return;
+        const ptype = payload.object.get("type") orelse return;
+        if (ptype != .string or !std.mem.eql(u8, ptype.string, "message")) return;
+        const role = payload.object.get("role") orelse return;
+        if (role != .string or !std.mem.eql(u8, role.string, "user")) return;
+        const content = payload.object.get("content") orelse return;
+        const text = self.contentText(content) orelse return;
+        if (text.len == 0 or std.mem.startsWith(u8, text, "<")) return;
+        self.add(.{ .agent = .codex, .title = state.session_title, .text = text, .project = state.cwd, .session = state.session_id, .ts = if (state.fallback_ts > 0) state.fallback_ts else line_ts, .meta = state.meta });
     }
 
     fn scanPi(self: *Scanner) void {
@@ -1339,7 +1394,7 @@ test "codex cache without footer rolls back appended records" {
     try sc.records.append(sc.a, .{ .agent = .claude, .text = "keep", .project = "", .session = "old", .ts = 1 });
     const stamp = SourceStamp{ .size_text = "100", .mtime_text = "200" };
     const data =
-        \\{"kind":"header","version":4,"source":"/source.jsonl","source_size":"100","source_mtime_ns":"200"}
+        \\{"kind":"header","version":5,"source":"/source.jsonl","source_size":"100","source_mtime_ns":"200"}
         \\{"kind":"record","title":"Partial title","text":"partial","project":"/p","session":"s","ts":3,"provider":"","model":"","thinking":"","plan":"","input":0,"output":0,"cache_read":0,"cache_write":0,"total":0,"context_window":0,"rate_percent":0,"cost":0}
     ;
     try testing.expect(!sc.parseCodexCache(data, "/source.jsonl", stamp));
@@ -1361,6 +1416,47 @@ test "codex session fallback timestamp becomes session last active time" {
     try testing.expectEqualStrings("Indexed Codex title", sc.records.items[0].title);
     try testing.expectEqualStrings("codex prompt", sc.records.items[0].text);
     try testing.expectEqual(@as(i64, 1770001234), sc.records.items[0].ts);
+}
+
+test "parse codex session accepts input_text content blocks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sc = testScanner(arena.allocator());
+    const data =
+        \\{"type":"session_meta","payload":{"cwd":"/work/proj","id":"codex-session"}}
+        \\{"type":"response_item","timestamp":"2026-06-28T03:15:09Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first prompt part"},{"type":"input_text","text":"second prompt part"}]}}
+    ;
+
+    sc.parseCodexSession(data);
+
+    try testing.expectEqual(@as(usize, 1), sc.records.items.len);
+    try testing.expectEqualStrings("first prompt part second prompt part", sc.records.items[0].text);
+    try testing.expectEqualStrings("/work/proj", sc.records.items[0].project);
+    try testing.expectEqualStrings("codex-session", sc.records.items[0].session);
+}
+
+test "streaming codex session parser extracts input_text records" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data =
+        \\{"type":"session_meta","payload":{"cwd":"/work/proj","id":"codex-stream"}}
+        \\{"type":"response_item","timestamp":"2026-06-28T03:15:09Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"streamed prompt"}]}}
+    ;
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "session.jsonl", .data = data });
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/session.jsonl", .{tmp.sub_path});
+    var sc = testScanner(a);
+    sc.io = testing.io;
+
+    try testing.expect(sc.scanCodexSessionStreaming(path, 1770002222));
+
+    try testing.expectEqual(@as(usize, 1), sc.records.items.len);
+    try testing.expectEqualStrings("streamed prompt", sc.records.items[0].text);
+    try testing.expectEqualStrings("/work/proj", sc.records.items[0].project);
+    try testing.expectEqualStrings("codex-stream", sc.records.items[0].session);
+    try testing.expectEqual(@as(i64, 1770002222), sc.records.items[0].ts);
 }
 
 test "parse pi session: only user messages, session id + cwd captured" {

@@ -125,7 +125,7 @@ Each agent shows up in its own brand color, and each result shows a compact last
 opencode keeps its history in a SQLite database, so reading it needs the `sqlite3` CLI on your `PATH`. If it is missing, zehn skips opencode and says so instead of failing.
 
 Codex session files can get large. zehn keeps a derived cache of extracted Codex
-user prompts in `~/.ghostex/zehn/codex-sessions-v4`, invalidated by each source
+user prompts in `~/.ghostex/zehn/codex-sessions-v5`, invalidated by each source
 file's size and modified time. Codex titles are read from `~/.codex/session_index.jsonl`
 by session id so title changes can still appear when the transcript cache is warm.
 The original session files remain the source of truth, and the cache can be
